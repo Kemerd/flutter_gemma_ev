@@ -149,7 +149,21 @@ $BuildFile = "$LiteRtLmDir\c\BUILD"
 $StubFile = "$LiteRtLmDir\c\capi_dll_entry.cc"
 $BuildBackup = "$BuildFile.flutter_gemma_backup"
 
-# Backup original BUILD file
+# Strip any leftover flutter_gemma targets from previous failed runs before backup
+$buildContent = Get-Content -Path $BuildFile -Raw
+$marker = "# Flutter Gemma: Shared library target for Dart FFI"
+if ($buildContent -match [regex]::Escape($marker)) {
+    Write-Host "  Cleaning leftover flutter_gemma targets from c/BUILD..." -ForegroundColor Yellow
+    # Remove everything from the first marker to end of file
+    $idx = $buildContent.IndexOf("# ======================================================================`n# Flutter Gemma")
+    if ($idx -lt 0) { $idx = $buildContent.IndexOf($marker) - 80 }  # rough fallback
+    if ($idx -gt 0) {
+        $buildContent = $buildContent.Substring(0, $idx).TrimEnd() + "`n"
+        Set-Content -Path $BuildFile -Value $buildContent -Encoding UTF8 -NoNewline
+    }
+}
+
+# Backup original (clean) BUILD file
 Copy-Item -Path $BuildFile -Destination $BuildBackup -Force
 
 # Create stub source file (Bazel cc_binary needs at least one source)
