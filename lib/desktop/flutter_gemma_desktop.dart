@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 import '../flutter_gemma_interface.dart';
 import '../model_file_manager_interface.dart';
@@ -11,17 +12,23 @@ import '../core/model.dart';
 import '../core/tool.dart';
 import '../core/chat.dart';
 import '../core/extensions.dart';
+import '../core/model_management/constants/preferences_keys.dart';
 
 import 'grpc_client.dart';
+import 'sentencepiece_tokenizer.dart';
 import 'server_process_manager.dart';
 
 // Import model management types from mobile (reuse for desktop)
+// EmbeddingModelSpec is a `part of` flutter_gemma_mobile.dart,
+// so it must be exported from there.
 import '../mobile/flutter_gemma_mobile.dart'
     show
         InferenceModelSpec,
+        EmbeddingModelSpec,
         MobileModelManager;
 
 part 'desktop_inference_model.dart';
+part 'desktop_embedding_model.dart';
 
 /// Desktop implementation of FlutterGemma plugin
 ///
@@ -52,8 +59,10 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
   InferenceModel? _initializedModel;
   InferenceModelSpec? _lastActiveInferenceSpec;
 
-  // Embedding model (not supported in MVP)
+  // Embedding model — loaded via tflite_flutter (desktop-specific)
   EmbeddingModel? _initializedEmbeddingModel;
+  Completer<EmbeddingModel>? _initEmbeddingCompleter;
+  EmbeddingModelSpec? _lastActiveEmbeddingSpec;
 
   @override
   ModelFileManager get modelManager => _modelManager;
@@ -203,11 +212,129 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
     String? tokenizerPath,
     PreferredBackend? preferredBackend,
   }) async {
-    // Embedding not supported in desktop MVP
-    throw UnsupportedError(
-      'Embedding models are not yet supported on desktop. '
-      'This feature is planned for a future release.',
-    );
+    // -----------------------------------------------------------------
+    // Check if the active embedding model changed since last creation
+    // -----------------------------------------------------------------
+    if (_initEmbeddingCompleter != null &&
+        _initializedEmbeddingModel != null &&
+        _lastActiveEmbeddingSpec != null) {
+      final activeModel = _modelManager.activeEmbeddingModel;
+      if (activeModel is EmbeddingModelSpec &&
+          _lastActiveEmbeddingSpec!.name != activeModel.name) {
+        // Active model changed — close old one and create new
+        debugPrint('[FlutterGemmaDesktop] Embedding model changed, recreating');
+        await _initializedEmbeddingModel?.close();
+        _initEmbeddingCompleter = null;
+        _initializedEmbeddingModel = null;
+        _lastActiveEmbeddingSpec = null;
+      } else {
+        // Same model — return existing instance
+        debugPrint('[FlutterGemmaDesktop] Reusing existing embedding model');
+        return _initEmbeddingCompleter!.future;
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // Modern API: resolve paths from the active EmbeddingModelSpec
+    // -----------------------------------------------------------------
+    if (modelPath == null || tokenizerPath == null) {
+      final activeModel = _modelManager.activeEmbeddingModel;
+
+      if (activeModel == null) {
+        throw StateError(
+          'No active embedding model set. '
+          'Use `FlutterGemma.installEmbedder()` or '
+          '`modelManager.setActiveModel()` to set a model first',
+        );
+      }
+
+      // Get the actual file paths through the unified model manager
+      final modelFilePaths =
+          await _modelManager.getModelFilePaths(activeModel);
+      if (modelFilePaths == null || modelFilePaths.isEmpty) {
+        throw StateError(
+          'Embedding model file paths not found. '
+          'Use the `modelManager` to install the model first',
+        );
+      }
+
+      // Extract model and tokenizer paths from the spec
+      final activeModelPath =
+          modelFilePaths[PreferencesKeys.embeddingModelFile];
+      final activeTokenizerPath =
+          modelFilePaths[PreferencesKeys.embeddingTokenizerFile];
+
+      if (activeModelPath == null || activeTokenizerPath == null) {
+        throw StateError(
+          'Could not find model or tokenizer path in active embedding model. '
+          'Model files: $modelFilePaths',
+        );
+      }
+
+      modelPath = activeModelPath;
+      tokenizerPath = activeTokenizerPath;
+
+      debugPrint('[FlutterGemmaDesktop] Using active embedding model: '
+          '$modelPath, tokenizer: $tokenizerPath');
+    } else {
+      // Legacy API with explicit paths — check if singleton exists
+      if (_initEmbeddingCompleter case Completer<EmbeddingModel> completer) {
+        debugPrint(
+            '[FlutterGemmaDesktop] Reusing existing embedding model (Legacy)');
+        return completer.future;
+      }
+    }
+
+    // Return existing completer if initialization is in progress
+    if (_initEmbeddingCompleter != null && _initializedEmbeddingModel != null) {
+      return _initEmbeddingCompleter!.future;
+    }
+
+    final completer = _initEmbeddingCompleter = Completer<EmbeddingModel>();
+
+    // Verify installation if using Modern API
+    final activeModel = _modelManager.activeEmbeddingModel;
+    if (activeModel != null) {
+      final isInstalled = await _modelManager.isModelInstalled(activeModel);
+      if (!isInstalled) {
+        completer.completeError(Exception(
+          'Active embedding model is no longer installed. '
+          'Use the `modelManager` to install the model first',
+        ));
+        return completer.future;
+      }
+    }
+
+    try {
+      // -----------------------------------------------------------------
+      // Create DesktopEmbeddingModel (tflite_flutter + SentencePiece)
+      // -----------------------------------------------------------------
+      final model =
+          _initializedEmbeddingModel = await DesktopEmbeddingModel.create(
+        modelPath: modelPath,
+        tokenizerPath: tokenizerPath,
+        preferredBackend: preferredBackend,
+        onClose: () {
+          _initializedEmbeddingModel = null;
+          _initEmbeddingCompleter = null;
+          _lastActiveEmbeddingSpec = null;
+        },
+      );
+
+      // Track which spec was used (Modern API only)
+      if (activeModel != null && activeModel is EmbeddingModelSpec) {
+        _lastActiveEmbeddingSpec = activeModel;
+      }
+
+      completer.complete(model);
+      return model;
+    } catch (e, st) {
+      _initEmbeddingCompleter = null;
+      _initializedEmbeddingModel = null;
+      _lastActiveEmbeddingSpec = null;
+      completer.completeError(e, st);
+      Error.throwWithStackTrace(e, st);
+    }
   }
 
   // === RAG Methods (not supported in MVP) ===

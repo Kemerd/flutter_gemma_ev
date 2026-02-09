@@ -30,6 +30,8 @@ dependencies:
   # Desktop gRPC support
   grpc: ^5.0.0
   protobuf: ^6.0.0
+  # Desktop embedding support (TFLite interpreter via FFI)
+  tflite_flutter: ^0.12.1
 
 dev_dependencies:
   flutter_test:
