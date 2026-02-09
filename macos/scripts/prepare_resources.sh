@@ -36,8 +36,11 @@ else
 fi
 echo "Architecture: $ARCH"
 
-# Prebuilt libraries for macOS ARM64 (from LiteRT-LM/prebuilt/macos_arm64/)
+# Libraries for macOS ARM64:
+#   - liblitert_lm_capi.dylib — main C API library (built via native/build_litert_lm_dll.sh)
+#   - Accelerator .dylib files — from LiteRT-LM/prebuilt/
 PREBUILT_LIBS=(
+    "liblitert_lm_capi.dylib"
     "libGemmaModelConstraintProvider.dylib"
     "libLiteRt.dylib"
     "libLiteRtMetalAccelerator.dylib"

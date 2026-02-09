@@ -21,7 +21,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
@@ -59,48 +58,53 @@ class LiteRtLmNativeClient {
 
   /// Resolve the path to the LiteRT-LM shared library for the current platform.
   ///
-  /// Searches in order:
-  ///   1. Next to the running executable (bundled by CMake/setup scripts)
-  ///   2. Development fallback paths
+  /// The library is built from LiteRT-LM source (see native/build_litert_lm_dll.*)
+  /// and bundled by the platform-specific CMake/setup scripts.
+  ///
+  /// Search order:
+  ///   1. litertlm/ subdirectory next to the executable (bundled by CMake)
+  ///   2. Directly next to the executable (development fallback)
   static String _resolveLibraryPath() {
     final executableDir = path.dirname(Platform.resolvedExecutable);
 
+    // Library name per platform — built from LiteRT-LM source via Bazel
+    // (see native/build_litert_lm_dll.ps1 / .sh)
+    final String libName;
+    if (Platform.isWindows) {
+      libName = 'litert_lm_capi.dll';
+    } else if (Platform.isMacOS) {
+      libName = 'liblitert_lm_capi.dylib';
+    } else {
+      libName = 'liblitert_lm_capi.so';
+    }
+
+    // Search paths in priority order
+    final searchPaths = <String>[];
+
     if (Platform.isWindows) {
       // Windows: litertlm/ subdirectory next to .exe
-      // The native shared library is built from the LiteRT-LM C API
-      final bundledPath = path.join(executableDir, 'litertlm', 'litert_lm.dll');
-      if (File(bundledPath).existsSync()) return bundledPath;
-
-      // Fallback: directly next to exe (development)
-      final devPath = path.join(executableDir, 'litert_lm.dll');
-      if (File(devPath).existsSync()) return devPath;
-
-      return bundledPath; // Let it fail with a clear path in the error
+      searchPaths.add(path.join(executableDir, 'litertlm', libName));
+      searchPaths.add(path.join(executableDir, libName));
     } else if (Platform.isMacOS) {
       // macOS: Frameworks/litertlm/ inside app bundle
-      final bundledPath = path.join(
-        executableDir, '..', 'Frameworks', 'litertlm', 'liblitert_lm.dylib',
-      );
-      if (File(bundledPath).existsSync()) return bundledPath;
-
-      // Fallback: next to exe (development)
-      final devPath = path.join(executableDir, 'liblitert_lm.dylib');
-      if (File(devPath).existsSync()) return devPath;
-
-      return bundledPath;
+      searchPaths.add(path.join(
+        executableDir, '..', 'Frameworks', 'litertlm', libName,
+      ));
+      searchPaths.add(path.join(executableDir, libName));
     } else {
       // Linux: lib/litertlm/ next to executable
-      final bundledPath = path.join(
-        executableDir, 'lib', 'litertlm', 'liblitert_lm.so',
-      );
-      if (File(bundledPath).existsSync()) return bundledPath;
-
-      // Fallback: next to exe (development)
-      final devPath = path.join(executableDir, 'liblitert_lm.so');
-      if (File(devPath).existsSync()) return devPath;
-
-      return bundledPath;
+      searchPaths.add(path.join(
+        executableDir, 'lib', 'litertlm', libName,
+      ));
+      searchPaths.add(path.join(executableDir, libName));
     }
+
+    // Return the first path that exists, or the first path (for error msg)
+    for (final p in searchPaths) {
+      if (File(p).existsSync()) return p;
+    }
+
+    return searchPaths.first;
   }
 
   // ==========================================================================

@@ -46,8 +46,11 @@ else
     exit 0
 fi
 
-# Prebuilt libraries we need for macOS ARM64
+# Libraries we need for macOS ARM64:
+#   - liblitert_lm_capi.dylib — main C API library (built from source via native/build_litert_lm_dll.sh)
+#   - Accelerator .dylib files — from LiteRT-LM/prebuilt/
 PREBUILT_LIBS=(
+    "liblitert_lm_capi.dylib"
     "libGemmaModelConstraintProvider.dylib"
     "libLiteRt.dylib"
     "libLiteRtMetalAccelerator.dylib"
@@ -91,10 +94,12 @@ download_if_not_cached() {
         return
     fi
 
-    # Check local dev paths (cloned LiteRT-LM repo next to this project)
+    # Check local dev paths:
+    #   1. native/prebuilt/ (built by native/build_litert_lm_dll.sh)
+    #   2. LiteRT-LM-ref/prebuilt/ (cloned repo)
     for local_path in \
-        "$PLUGIN_ROOT/../LiteRT-LM-ref/prebuilt/$NATIVE_ARCH/$filename" \
-        "$PLUGIN_ROOT/native/prebuilt/$NATIVE_ARCH/$filename"; do
+        "$PLUGIN_ROOT/native/prebuilt/$NATIVE_ARCH/$filename" \
+        "$PLUGIN_ROOT/../LiteRT-LM-ref/prebuilt/$NATIVE_ARCH/$filename"; do
         if [ -f "$local_path" ]; then
             cp "$local_path" "$dest_file"
             cp "$local_path" "$cached_file"
@@ -105,6 +110,7 @@ download_if_not_cached() {
     done
 
     # Download from GitHub (raw URL handles LFS redirect)
+    # Note: liblitert_lm_capi.dylib is NOT on GitHub — it must be built locally
     local url="$GITHUB_BASE_URL/$NATIVE_ARCH/$filename"
     echo "  [download] $filename from GitHub..."
     if curl -fSL --retry 3 -o "$cached_file" "$url"; then
@@ -112,7 +118,11 @@ download_if_not_cached() {
         sign_lib "$dest_file"
         echo "  [ok]       $filename"
     else
-        echo "  [FAILED]   $filename (URL: $url)" >&2
+        if [ "$filename" = "liblitert_lm_capi.dylib" ]; then
+            echo "  [MISSING]  $filename — run native/build_litert_lm_dll.sh to build from source" >&2
+        else
+            echo "  [FAILED]   $filename (URL: $url)" >&2
+        fi
         rm -f "$cached_file"
     fi
 }

@@ -51,8 +51,11 @@ Write-Host "Output dir: $OutputDir"
 
 $PluginRoot = Split-Path -Parent $PluginDir
 
-# Prebuilt libraries we need for Windows (from LiteRT-LM/prebuilt/windows_x86_64/)
+# Libraries we need for Windows:
+#   - litert_lm_capi.dll  — the main C API library (built from source via native/build_litert_lm_dll.ps1)
+#   - Accelerator DLLs    — from LiteRT-LM/prebuilt/windows_x86_64/
 $PrebuiltLibs = @(
+    "litert_lm_capi.dll",
     "libGemmaModelConstraintProvider.dll",
     "libLiteRt.dll",
     "libLiteRtTopKWebGpuSampler.dll",
@@ -92,10 +95,12 @@ function Download-IfNotCached {
         return
     }
 
-    # Check local dev paths (cloned LiteRT-LM repo next to this project)
+    # Check local dev paths:
+    #   1. native/prebuilt/ (built by native/build_litert_lm_dll.ps1)
+    #   2. LiteRT-LM-ref/prebuilt/ (cloned repo)
     $localPaths = @(
-        "$PluginRoot\..\LiteRT-LM-ref\prebuilt\$NativeArch\$FileName",
-        "$PluginRoot\native\prebuilt\$NativeArch\$FileName"
+        "$PluginRoot\native\prebuilt\$NativeArch\$FileName",
+        "$PluginRoot\..\LiteRT-LM-ref\prebuilt\$NativeArch\$FileName"
     )
     foreach ($localPath in $localPaths) {
         if (Test-Path $localPath) {
@@ -107,6 +112,7 @@ function Download-IfNotCached {
     }
 
     # Download from GitHub (raw URL handles LFS redirect)
+    # Note: litert_lm_capi.dll is NOT on GitHub — it must be built locally
     $url = "$GitHubBaseUrl/$NativeArch/$FileName"
     Write-Host "  [download] $FileName from GitHub..." -ForegroundColor Cyan
     try {
@@ -115,8 +121,13 @@ function Download-IfNotCached {
         Copy-Item -Path $cachedFile -Destination $destFile -Force
         Write-Host "  [ok]     $FileName" -ForegroundColor Green
     } catch {
-        Write-Warning "  Failed to download $FileName : $_"
-        Write-Host "  URL: $url" -ForegroundColor Gray
+        # Not fatal for the main CAPI library — it must be built from source
+        if ($FileName -eq "litert_lm_capi.dll") {
+            Write-Host "  [MISSING] $FileName — run native\build_litert_lm_dll.ps1 to build from source" -ForegroundColor Red
+        } else {
+            Write-Warning "  Failed to download $FileName : $_"
+            Write-Host "  URL: $url" -ForegroundColor Gray
+        }
     }
 }
 
