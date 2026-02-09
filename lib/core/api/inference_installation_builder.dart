@@ -3,7 +3,7 @@ import 'package:flutter_gemma/core/domain/model_source.dart';
 import 'package:flutter_gemma/core/di/service_registry.dart';
 import 'package:flutter_gemma/core/utils/file_name_utils.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
-import 'package:path/path.dart' as path;
+import 'package:path/path.dart' as p;
 
 /// Fluent builder for inference model installation
 ///
@@ -217,12 +217,15 @@ class InferenceInstallationBuilder {
     return InferenceInstallation(spec: spec);
   }
 
+  /// Extract just the filename from any ModelSource.
+  /// Uses platform-aware p.basename() for FileSource to handle both
+  /// Unix (/) and Windows (\) path separators correctly.
   String _extractFilename(ModelSource source) {
     return switch (source) {
-      NetworkSource(:final url) => path.basename(Uri.parse(url).path),
+      NetworkSource(:final url) => p.basename(Uri.parse(url).path),
       AssetSource(:final path) => path.split('/').last,
       BundledSource(:final resourceName) => resourceName,
-      FileSource(:final path) => path.split('/').last,
+      FileSource(:final path) => p.basename(path),
     };
   }
 }

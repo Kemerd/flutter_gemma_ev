@@ -29,12 +29,16 @@ class InferenceModelFile extends ModelFile {
   @override
   bool get isRequired => true;
 
+  /// Extract filename from any ModelSource.
+  /// Uses platform-aware path.basename() for FileSource to handle both
+  /// Unix (/) and Windows (\) path separators correctly.
   static String _extractFilenameFromSource(ModelSource source) {
     return switch (source) {
       NetworkSource(:final url) => Uri.parse(url).pathSegments.last,
       AssetSource(:final path) => path.split('/').last,
       BundledSource(:final resourceName) => resourceName,
-      FileSource(:final path) => path.split('/').last,
+      // Rename destructured field to avoid shadowing the `path` package import
+      FileSource(path: final filePath) => path.basename(filePath),
     };
   }
 }

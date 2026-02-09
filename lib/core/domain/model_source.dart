@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/foundation.dart' show kIsWeb;
 
 // Constants for URL schemes and validation
@@ -196,7 +198,7 @@ final class BundledSource extends ModelSource {
   String toString() => 'BundledSource(resourceName: $resourceName)';
 }
 
-/// File source - external files (mobile only)
+/// File source - external files (mobile / desktop)
 final class FileSource extends ModelSource {
   final String path;
 
@@ -207,9 +209,32 @@ final class FileSource extends ModelSource {
     if (path.isEmpty) {
       throw ArgumentError('File path cannot be empty');
     }
-    if (!path.startsWith(_pathSeparator)) {
-      throw ArgumentError('File path must be absolute (start with $_pathSeparator)');
+    // Validate absolute path — accept both Unix (/) and Windows (C:\) styles
+    if (!_isAbsolutePath(path)) {
+      throw ArgumentError(
+        'File path must be absolute (Unix: starts with /, Windows: starts with drive letter)',
+      );
     }
+  }
+
+  /// Platform-aware absolute-path check.
+  /// Unix:    /path/to/file
+  /// Windows: C:\path\to\file  or  C:/path/to/file
+  static bool _isAbsolutePath(String p) {
+    if (p.startsWith(_pathSeparator)) return true;
+    // Windows drive letter check (e.g. C:\ or D:/)
+    if (!kIsWeb && Platform.isWindows && p.length >= 3) {
+      final drive = p[0];
+      final colon = p[1];
+      final sep = p[2];
+      if ((drive.toUpperCase().codeUnitAt(0) >= 65 &&
+              drive.toUpperCase().codeUnitAt(0) <= 90) &&
+          colon == ':' &&
+          (sep == '\\' || sep == '/')) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @override
