@@ -198,6 +198,16 @@ try {
 
     Push-Location $LiteRtLmDir
 
+    # Ensure Bazel uses Git Bash (not WSL) for shell commands like sed/patch.
+    # Without this, repository patch_cmds fail with "WSL2 is not supported".
+    $gitBash = "C:\Program Files\Git\bin\bash.exe"
+    if (Test-Path $gitBash) {
+        $env:BAZEL_SH = $gitBash
+        Write-Host "  BAZEL_SH=$gitBash" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  WARNING: Git Bash not found at $gitBash" -ForegroundColor Yellow
+    }
+
     # Run the Bazel build.
     # Use $ErrorActionPreference = "Continue" locally so stderr from
     # bazelisk/bazel (download progress, build status) is not fatal.
