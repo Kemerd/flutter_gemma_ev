@@ -14,9 +14,8 @@ import '../core/chat.dart';
 import '../core/extensions.dart';
 import '../core/model_management/constants/preferences_keys.dart';
 
-import 'grpc_client.dart';
+import 'litertlm_native_client.dart';
 import 'sentencepiece_tokenizer.dart';
-import 'server_process_manager.dart';
 
 // Import model management types from mobile (reuse for desktop)
 // EmbeddingModelSpec is a `part of` flutter_gemma_mobile.dart,
@@ -32,8 +31,8 @@ part 'desktop_embedding_model.dart';
 
 /// Desktop implementation of FlutterGemma plugin
 ///
-/// Uses gRPC to communicate with a local Kotlin/JVM server
-/// running LiteRT-LM for model inference.
+/// Uses native FFI to communicate directly with LiteRT-LM's C API.
+/// No Java, no gRPC, no server process — just dart:ffi to native code.
 class FlutterGemmaDesktop extends FlutterGemmaPlugin {
   FlutterGemmaDesktop._();
 
@@ -72,14 +71,6 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
 
   @override
   EmbeddingModel? get initializedEmbeddingModel => _initializedEmbeddingModel;
-
-  /// Start the gRPC server if not running
-  Future<void> _ensureServerRunning() async {
-    final serverManager = ServerProcessManager.instance;
-    if (!serverManager.isRunning) {
-      await serverManager.start();
-    }
-  }
 
   @override
   Future<InferenceModel> createModel({
@@ -152,16 +143,11 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
       final modelPath = modelFilePaths.values.first;
       debugPrint('[FlutterGemmaDesktop] Using model: $modelPath');
 
-      // Start server and create gRPC client
-      await _ensureServerRunning();
+      // Create native FFI client and initialize engine directly
+      final nativeClient = LiteRtLmNativeClient();
 
-      final grpcClient = LiteRtLmClient();
-      await grpcClient.connect();
-
-      // Initialize model - server validates file existence
-      // This avoids TOCTOU race condition (file could be deleted between check and use)
       try {
-        await grpcClient.initialize(
+        await nativeClient.initialize(
           modelPath: modelPath,
           backend: preferredBackend == PreferredBackend.cpu ? 'cpu' : 'gpu',
           maxTokens: maxTokens,
@@ -182,7 +168,7 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
 
       // Create model instance
       final model = _initializedModel = DesktopInferenceModel(
-        grpcClient: grpcClient,
+        nativeClient: nativeClient,
         maxTokens: maxTokens,
         modelType: modelType,
         fileType: fileType,

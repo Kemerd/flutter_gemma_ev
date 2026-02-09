@@ -1,9 +1,9 @@
 part of 'flutter_gemma_desktop.dart';
 
-/// Desktop implementation of InferenceModel using gRPC
+/// Desktop implementation of InferenceModel using native FFI
 class DesktopInferenceModel extends InferenceModel {
   DesktopInferenceModel({
-    required this.grpcClient,
+    required this.nativeClient,
     required this.maxTokens,
     required this.modelType,
     this.fileType = ModelFileType.task,
@@ -12,7 +12,7 @@ class DesktopInferenceModel extends InferenceModel {
     required this.onClose,
   });
 
-  final LiteRtLmClient grpcClient;
+  final LiteRtLmNativeClient nativeClient;
   final ModelType modelType;
   @override
   final ModelFileType fileType;
@@ -50,15 +50,15 @@ class DesktopInferenceModel extends InferenceModel {
     final completer = _createCompleter = Completer<InferenceModelSession>();
 
     try {
-      // Create conversation on server with sampler config
-      await grpcClient.createConversation(
+      // Create conversation on native engine with sampler config
+      await nativeClient.createConversation(
         temperature: temperature,
         topK: topK,
         topP: topP,
       );
 
       final session = _session = DesktopInferenceModelSession(
-        grpcClient: grpcClient,
+        nativeClient: nativeClient,
         modelType: modelType,
         fileType: fileType,
         supportImage: enableVisionModality ?? supportImage,
@@ -124,13 +124,9 @@ class DesktopInferenceModel extends InferenceModel {
       await _session?.close();
     } finally {
       try {
-        await grpcClient.shutdown();
+        await nativeClient.shutdown();
       } finally {
-        try {
-          await grpcClient.disconnect();
-        } finally {
-          onClose();
-        }
+        onClose();
       }
     }
   }
@@ -138,7 +134,7 @@ class DesktopInferenceModel extends InferenceModel {
 
 /// Desktop implementation of InferenceModelSession.
 ///
-/// Uses gRPC to communicate with the LiteRT-LM server.
+/// Uses native FFI to communicate directly with LiteRT-LM.
 /// Buffers query chunks, images, and audio until [getResponse] is called.
 ///
 /// **Thread Safety:** This session is NOT thread-safe. All method calls
@@ -146,7 +142,7 @@ class DesktopInferenceModel extends InferenceModel {
 /// isolates may cause undefined behavior.
 class DesktopInferenceModelSession extends InferenceModelSession {
   DesktopInferenceModelSession({
-    required this.grpcClient,
+    required this.nativeClient,
     required this.modelType,
     required this.fileType,
     required this.supportImage,
@@ -154,7 +150,7 @@ class DesktopInferenceModelSession extends InferenceModelSession {
     required this.onClose,
   });
 
-  final LiteRtLmClient grpcClient;
+  final LiteRtLmNativeClient nativeClient;
   final ModelType modelType;
   final ModelFileType fileType;
   final bool supportImage;
@@ -206,15 +202,15 @@ class DesktopInferenceModelSession extends InferenceModelSession {
     final buffer = StringBuffer();
 
     if (audio != null) {
-      await for (final token in grpcClient.chatWithAudio(text, audio)) {
+      await for (final token in nativeClient.chatWithAudio(text, audio)) {
         buffer.write(token);
       }
     } else if (image != null) {
-      await for (final token in grpcClient.chatWithImage(text, image)) {
+      await for (final token in nativeClient.chatWithImage(text, image)) {
         buffer.write(token);
       }
     } else {
-      await for (final token in grpcClient.chat(text)) {
+      await for (final token in nativeClient.chat(text)) {
         buffer.write(token);
       }
     }
@@ -240,13 +236,13 @@ class DesktopInferenceModelSession extends InferenceModelSession {
 
     if (audio != null) {
       debugPrint('[DesktopSession] Calling chatWithAudio: audio=${audio.length} bytes');
-      yield* grpcClient.chatWithAudio(text, audio);
+      yield* nativeClient.chatWithAudio(text, audio);
     } else if (image != null) {
       debugPrint('[DesktopSession] Calling chatWithImage: image=${image.length} bytes');
-      yield* grpcClient.chatWithImage(text, image);
+      yield* nativeClient.chatWithImage(text, image);
     } else {
       debugPrint('[DesktopSession] Calling chat (no image/audio)');
-      yield* grpcClient.chat(text);
+      yield* nativeClient.chat(text);
     }
   }
 
@@ -259,9 +255,9 @@ class DesktopInferenceModelSession extends InferenceModelSession {
 
   @override
   Future<void> stopGeneration() async {
-    // gRPC streaming doesn't support mid-stream cancellation easily
-    // For MVP, this is a no-op
-    debugPrint('[DesktopSession] stopGeneration not fully implemented');
+    // Use the native cancel API
+    nativeClient.cancelGeneration();
+    debugPrint('[DesktopSession] stopGeneration called');
   }
 
   @override
@@ -273,7 +269,7 @@ class DesktopInferenceModelSession extends InferenceModelSession {
     _pendingImage = null;
     _pendingAudio = null;
 
-    await grpcClient.closeConversation();
+    await nativeClient.closeConversation();
     onClose();
   }
 }

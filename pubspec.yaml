@@ -1,6 +1,6 @@
 name: flutter_gemma
 description: "The plugin allows running the Gemma AI model locally on a device from a Flutter application. Includes support for Gemma 3 Nano models with optimized MediaPipe GenAI v0.10.24."
-version: 0.12.3
+version: 0.12.4
 homepage: https://github.com/DenisovAV/flutter_gemma
 repository: https://github.com/DenisovAV/flutter_gemma
 
@@ -27,9 +27,8 @@ dependencies:
   plugin_platform_interface: ^2.0.2
   shared_preferences: ^2.5.2
   background_downloader: ^9.2.3
-  # Desktop gRPC support
-  grpc: ^5.0.0
-  protobuf: ^6.0.0
+  # Desktop native FFI support (LiteRT-LM C API)
+  ffi: ^2.1.0
   # Desktop embedding support (TFLite interpreter via FFI)
   tflite_flutter: ^0.12.1
 
