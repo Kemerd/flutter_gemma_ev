@@ -73,21 +73,12 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     debugPrint('[DesktopEmbedding] InterpreterOptions created '
         '(threads: $cpuCount)');
 
-    // XNNPack gives a nice speed boost on desktop CPUs.
-    // GPU delegate is not reliably available on desktop via tflite_flutter,
-    // so we always use CPU + XNNPack regardless of preferredBackend.
-    // NOTE: Some mixed-precision models may crash with XNNPack; if so we
-    //       retry without it below.
-    bool useXnnpack = true;
-    try {
-      options.addDelegate(XNNPackDelegate(
-        options: XNNPackDelegateOptions(numThreads: cpuCount),
-      ));
-      debugPrint('[DesktopEmbedding] XNNPack delegate enabled ($cpuCount threads)');
-    } catch (e) {
-      useXnnpack = false;
-      debugPrint('[DesktopEmbedding] XNNPack unavailable, using default CPU: $e');
-    }
+    // XNNPack is disabled for now — the delegate constructor crashes on
+    // Windows with certain TFLite C library builds.  Plain CPU with
+    // multi-threading still gives decent performance.
+    // TODO(desktop): Re-enable once a compatible TFLite build is confirmed.
+    const bool useXnnpack = false;
+    debugPrint('[DesktopEmbedding] Using plain CPU backend (XNNPack disabled)');
 
     // -----------------------------------------------------------------
     // Load the TFLite model (with XNNPack fallback)
