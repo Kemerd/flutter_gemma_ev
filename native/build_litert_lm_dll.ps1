@@ -222,6 +222,18 @@ try {
         Write-Host "  WARNING: Git Bash not found at $gitBash" -ForegroundColor Yellow
     }
 
+    # Point Bazel to the correct Visual C++ installation to avoid auto-detection issues.
+    if (-not $env:BAZEL_VC) {
+        $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path $vsWhere) {
+            $vsPath = & $vsWhere -latest -property installationPath 2>$null
+            if ($vsPath -and (Test-Path "$vsPath\VC")) {
+                $env:BAZEL_VC = "$vsPath\VC"
+                Write-Host "  BAZEL_VC=$($env:BAZEL_VC)" -ForegroundColor DarkGray
+            }
+        }
+    }
+
     # Run the Bazel build.
     # Use $ErrorActionPreference = "Continue" locally so stderr from
     # bazelisk/bazel (download progress, build status) is not fatal.
@@ -231,7 +243,9 @@ try {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
 
-    & $bazel build //c:litert_lm_capi --config=windows 2>&1 | ForEach-Object {
+    # Use a short output_user_root to avoid Windows 260-char path limit
+    # (Rust proc-macro intermediate files have extremely long names)
+    & $bazel --output_user_root=C:/b build //c:litert_lm_capi --config=windows 2>&1 | ForEach-Object {
         Write-Host "  $_"
     }
     $buildExitCode = $LASTEXITCODE
