@@ -16,7 +16,7 @@ Flutter plugin for running Gemma AI models locally on macOS using LiteRT-LM.
   s.source           = { :path => '.' }
   s.source_files     = 'Classes/**/*'
 
-  # Resources - JAR file for LiteRT-LM server
+  # Resources - prebuilt LiteRT-LM native libraries (downloaded by prepare_resources.sh)
   s.resources        = ['Resources/**/*']
 
   s.dependency 'FlutterMacOS'

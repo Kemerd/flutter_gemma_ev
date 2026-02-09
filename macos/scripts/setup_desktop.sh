@@ -1,14 +1,23 @@
 #!/bin/bash
-# LiteRT-LM Desktop Setup Script for Flutter Gemma Plugin
-# Version: 0.11.14
-# Downloads JRE, copies JAR, extracts natives, and signs for macOS sandbox
 #
-# Usage: setup_desktop.sh <PODS_TARGET_SRCROOT> <FRAMEWORKS_PATH>
-# Called by CocoaPods script_phase during pod installation
+# LiteRT-LM Native Desktop Setup Script for Flutter Gemma (macOS)
+#
+# Downloads prebuilt LiteRT-LM accelerator libraries from GitHub and
+# signs them for macOS sandbox/Gatekeeper.
+# No Java, no JRE, no JAR — pure native.
+#
+# Usage: setup_desktop.sh <PODS_TARGET_SRCROOT> <APP_BUNDLE_PATH>
 
 set -e
 
-echo "=== LiteRT-LM Desktop Setup (macOS) ==="
+echo "=== LiteRT-LM Native Desktop Setup (macOS) ==="
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# GitHub base URL for raw LFS file downloads
+GITHUB_BASE_URL="https://github.com/google-ai-edge/LiteRT-LM/raw/main/prebuilt"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PODS_ROOT="${1:-$SCRIPT_DIR/..}"
@@ -20,7 +29,6 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 0
 fi
 
-# Skip if no app bundle path
 if [[ -z "$APP_BUNDLE" || ! -d "$APP_BUNDLE" ]]; then
     echo "No valid app bundle path provided: $APP_BUNDLE"
     exit 0
@@ -28,453 +36,125 @@ fi
 
 echo "App bundle: $APP_BUNDLE"
 
-# Paths
-PLUGIN_ROOT="$(cd "$PODS_ROOT/.." && pwd)"
-RESOURCES_DIR="$APP_BUNDLE/Contents/Resources"
-FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
-
-# JRE settings - Using Azul Zulu (Temurin has Jinja template issues on macOS)
-JRE_VERSION="24.0.2"
-# Use macOS standard cache location (~/Library/Caches per Apple guidelines)
-JRE_CACHE_DIR="$HOME/Library/Caches/flutter_gemma/jre"
-JRE_DEST="$RESOURCES_DIR/jre"
-
-# Detect architecture
+# Architecture detection — only Apple Silicon supported
 ARCH=$(uname -m)
 if [[ "$ARCH" == "arm64" ]]; then
-    JRE_ARCH="aarch64"
+    NATIVE_ARCH="macos_arm64"
 else
-    JRE_ARCH="x64"
+    echo "WARNING: Intel Mac (x86_64) is not supported by LiteRT-LM prebuilts"
+    echo "  Desktop support requires Apple Silicon (M1/M2/M3/M4)"
+    exit 0
 fi
 
-# Azul Zulu JRE - more compatible with LiteRT-LM native libraries
-JRE_ARCHIVE="zulu24.32.13-ca-jre${JRE_VERSION}-macosx_${JRE_ARCH}.tar.gz"
-JRE_URL="https://cdn.azul.com/zulu/bin/${JRE_ARCHIVE}"
+# Prebuilt libraries we need for macOS ARM64
+PREBUILT_LIBS=(
+    "libGemmaModelConstraintProvider.dylib"
+    "libLiteRt.dylib"
+    "libLiteRtMetalAccelerator.dylib"
+    "libLiteRtTopKWebGpuSampler.dylib"
+    "libLiteRtWebGpuAccelerator.dylib"
+)
 
-# SHA256 checksums for Azul Zulu JRE 24.0.2
-# Note: Using simple variables instead of associative arrays for bash 3.x compatibility (macOS default)
-JRE_CHECKSUM_AARCH64="709ae98bcbcb94de7c5211769df7bf83b3ba9d742c7fd2f6594ba88fd2921388"
-JRE_CHECKSUM_X64="4a36280b411db58952bc97a26f96b184222b23d36ea5008a6ee34744989ff929"
-
-# JAR settings
-JAR_NAME="litertlm-server.jar"
-JAR_VERSION="0.12.3"
-JAR_URL="https://github.com/DenisovAV/flutter_gemma/releases/download/v${JAR_VERSION}/${JAR_NAME}"
-JAR_CHECKSUM="c43018ff29516d522f03dc0d6dad07065e439e5c0c8a58fc2730acf25f45ce55"
-JAR_CACHE_DIR="$HOME/Library/Caches/flutter_gemma/jar"
+PLUGIN_ROOT="$(cd "$PODS_ROOT/.." && pwd)"
+FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
+NATIVES_DIR="$FRAMEWORKS_DIR/litertlm"
+CACHE_DIR="$HOME/Library/Caches/flutter_gemma/prebuilt/$NATIVE_ARCH"
 
 echo "Plugin root: $PLUGIN_ROOT"
-echo "Resources: $RESOURCES_DIR"
-echo "Frameworks: $FRAMEWORKS_DIR"
-echo "Architecture: $ARCH ($JRE_ARCH)"
+echo "Frameworks:  $FRAMEWORKS_DIR"
+echo "Architecture: $ARCH"
 
-# Create directories
-mkdir -p "$RESOURCES_DIR"
-mkdir -p "$FRAMEWORKS_DIR"
+mkdir -p "$NATIVES_DIR"
+mkdir -p "$CACHE_DIR"
 
-# === Download and install JRE ===
-download_jre() {
-    # Check for actual java binary instead of marker file
-    if [[ -x "$JRE_DEST/bin/java" ]]; then
-        echo "JRE already installed in app bundle"
-        return 0
+# ============================================================================
+# Helper: download a file if not cached, then codesign for macOS
+# ============================================================================
+download_if_not_cached() {
+    local filename="$1"
+    local dest_dir="$2"
+
+    local cached_file="$CACHE_DIR/$filename"
+    local dest_file="$dest_dir/$filename"
+
+    # Already in output? Skip.
+    if [ -f "$dest_file" ]; then
+        echo "  [cached]   $filename"
+        return
     fi
 
-    echo "Setting up JRE..."
-    mkdir -p "$JRE_CACHE_DIR"
-
-    local archive="$JRE_CACHE_DIR/$JRE_ARCHIVE"
-    # Zulu archive extracts to zulu24.32.13-ca-jre24.0.2-macosx_<arch>/
-    local extracted="$JRE_CACHE_DIR/zulu24.32.13-ca-jre${JRE_VERSION}-macosx_${JRE_ARCH}"
-    local extraction_marker="$extracted/.extracted"
-
-    # Download if not cached
-    if [[ ! -f "$archive" ]]; then
-        echo "Downloading JRE from $JRE_URL..."
-        if ! curl -L -o "$archive" "$JRE_URL" --fail --retry 3 --progress-bar; then
-            echo "ERROR: Failed to download JRE"
-            rm -f "$archive"  # Remove partial download
-            exit 1
-        fi
-
-        # Verify checksum (using simple variables for bash 3.x compatibility)
-        local expected_checksum=""
-        if [[ "$JRE_ARCH" == "aarch64" ]]; then
-            expected_checksum="$JRE_CHECKSUM_AARCH64"
-        else
-            expected_checksum="$JRE_CHECKSUM_X64"
-        fi
-        if [[ -n "$expected_checksum" ]]; then
-            echo "Verifying checksum..."
-            local actual_checksum
-            actual_checksum=$(shasum -a 256 "$archive" | awk '{print $1}')
-            if [[ "$actual_checksum" != "$expected_checksum" ]]; then
-                rm -f "$archive"
-                echo "ERROR: JRE checksum mismatch!"
-                echo "  Expected: $expected_checksum"
-                echo "  Got: $actual_checksum"
-                exit 1
-            fi
-            echo "Checksum verified"
-        else
-            echo "WARNING: Checksum not available for $JRE_ARCH, skipping verification"
-        fi
-    else
-        echo "Using cached JRE archive"
+    # Check local cache
+    if [ -f "$cached_file" ]; then
+        cp "$cached_file" "$dest_file"
+        sign_lib "$dest_file"
+        echo "  [cache]    $filename"
+        return
     fi
 
-    # Extract if needed (check marker file, not just directory existence)
-    if [[ ! -f "$extraction_marker" ]]; then
-        echo "Extracting JRE..."
-        # Remove partial extraction if exists
-        rm -rf "$extracted"
-        tar -xzf "$archive" -C "$JRE_CACHE_DIR"
-        # Mark extraction complete
-        touch "$extraction_marker"
-    fi
-
-    # Copy to app bundle
-    # Zulu has bin/ and lib/ directly in root (no Contents/Home)
-    echo "Copying JRE to app bundle..."
-    mkdir -p "$JRE_DEST"
-    cp -R "$extracted/"* "$JRE_DEST/"
-
-    echo "JRE installed successfully"
-}
-
-# === Check JDK version ===
-check_jdk_version() {
-    local java_cmd="$1"
-    local required_version=24
-
-    if [[ ! -x "$java_cmd" ]]; then
-        return 1
-    fi
-
-    # Get Java version
-    local version_output
-    version_output=$("$java_cmd" -version 2>&1 | head -1)
-
-    # Extract major version number
-    local major_version
-    if [[ "$version_output" =~ \"([0-9]+) ]]; then
-        major_version="${BASH_REMATCH[1]}"
-    elif [[ "$version_output" =~ ([0-9]+)\. ]]; then
-        major_version="${BASH_REMATCH[1]}"
-    else
-        return 1
-    fi
-
-    if [[ "$major_version" -ge "$required_version" ]]; then
-        echo "Found JDK $major_version (>= $required_version required)" >&2
-        return 0
-    else
-        echo "JDK $major_version found, but $required_version+ required" >&2
-        return 1
-    fi
-}
-
-# === Find JDK for building ===
-find_build_jdk() {
-    # Check JAVA_HOME first
-    if [[ -n "$JAVA_HOME" ]] && check_jdk_version "$JAVA_HOME/bin/java"; then
-        echo "$JAVA_HOME/bin/java"
-        return 0
-    fi
-
-    # Check common JDK locations on macOS
-    local jdk_paths=(
-        "/opt/homebrew/opt/openjdk@21/bin/java"
-        "/opt/homebrew/opt/openjdk/bin/java"
-        "/usr/local/opt/openjdk@21/bin/java"
-        "/usr/local/opt/openjdk/bin/java"
-        "/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin/java"
-        "/Library/Java/JavaVirtualMachines/zulu-21.jdk/Contents/Home/bin/java"
-    )
-
-    for java_path in "${jdk_paths[@]}"; do
-        if check_jdk_version "$java_path"; then
-            echo "$java_path"
-            return 0
+    # Check local dev paths (cloned LiteRT-LM repo next to this project)
+    for local_path in \
+        "$PLUGIN_ROOT/../LiteRT-LM-ref/prebuilt/$NATIVE_ARCH/$filename" \
+        "$PLUGIN_ROOT/native/prebuilt/$NATIVE_ARCH/$filename"; do
+        if [ -f "$local_path" ]; then
+            cp "$local_path" "$dest_file"
+            cp "$local_path" "$cached_file"
+            sign_lib "$dest_file"
+            echo "  [local]    $filename"
+            return
         fi
     done
 
-    # Try system java
-    if command -v java &>/dev/null && check_jdk_version "$(command -v java)"; then
-        command -v java
-        return 0
-    fi
-
-    return 1
-}
-
-# === Build JAR from source ===
-build_jar() {
-    local gradle_dir="$PLUGIN_ROOT/litertlm-server"
-    local gradle_wrapper="$gradle_dir/gradlew"
-
-    if [[ ! -f "$gradle_wrapper" ]]; then
-        echo "Gradle wrapper not found at $gradle_wrapper" >&2
-        return 1
-    fi
-
-    echo "Building JAR from source..." >&2
-    cd "$gradle_dir"
-
-    if ! "$gradle_wrapper" fatJar --no-daemon -q; then
-        echo "Gradle build failed" >&2
-        return 1
-    fi
-
-    # Find built JAR
-    local built_jar
-    built_jar=$(ls -t "$gradle_dir/build/libs/"*-all.jar 2>/dev/null | head -n1)
-
-    if [[ -n "$built_jar" && -f "$built_jar" ]]; then
-        echo "JAR built successfully: $built_jar" >&2
-        echo "$built_jar"
-        return 0
+    # Download from GitHub (raw URL handles LFS redirect)
+    local url="$GITHUB_BASE_URL/$NATIVE_ARCH/$filename"
+    echo "  [download] $filename from GitHub..."
+    if curl -fSL --retry 3 -o "$cached_file" "$url"; then
+        cp "$cached_file" "$dest_file"
+        sign_lib "$dest_file"
+        echo "  [ok]       $filename"
     else
-        echo "Built JAR not found" >&2
-        return 1
+        echo "  [FAILED]   $filename (URL: $url)" >&2
+        rm -f "$cached_file"
     fi
 }
 
-# === Download JAR as fallback ===
-download_jar() {
-    echo "Downloading JAR from $JAR_URL..." >&2
-    mkdir -p "$JAR_CACHE_DIR"
-
-    local cached_jar="$JAR_CACHE_DIR/$JAR_NAME"
-
-    if ! curl -L -o "$cached_jar" "$JAR_URL" --fail --retry 3 --progress-bar; then
-        echo "ERROR: Failed to download JAR" >&2
-        rm -f "$cached_jar"
-        return 1
-    fi
-
-    # Verify checksum
-    if [[ -n "$JAR_CHECKSUM" ]]; then
-        echo "Verifying checksum..." >&2
-        local actual_checksum
-        actual_checksum=$(shasum -a 256 "$cached_jar" | awk '{print $1}')
-        if [[ "$actual_checksum" != "$JAR_CHECKSUM" ]]; then
-            rm -f "$cached_jar"
-            echo "ERROR: JAR checksum mismatch!" >&2
-            echo "  Expected: $JAR_CHECKSUM" >&2
-            echo "  Got: $actual_checksum" >&2
-            return 1
-        fi
-        echo "Checksum verified" >&2
-    fi
-
-    echo "$cached_jar"
-    return 0
+# ============================================================================
+# Helper: codesign a library for macOS sandbox / Gatekeeper
+# ============================================================================
+sign_lib() {
+    local lib_path="$1"
+    # Remove quarantine attribute (downloaded files get flagged)
+    xattr -r -d com.apple.quarantine "$lib_path" 2>/dev/null || true
+    # Ad-hoc sign so macOS doesn't reject unsigned binaries
+    codesign --force --sign - "$lib_path" 2>/dev/null || true
 }
 
-# === Setup JAR (build or download) ===
-setup_jar() {
-    local jar_dest="$RESOURCES_DIR/$JAR_NAME"
+# ============================================================================
+# Install prebuilt accelerator libraries
+# ============================================================================
+install_prebuilt_libs() {
+    echo ""
+    echo "=== Installing prebuilt LiteRT-LM libraries ==="
 
-    if [[ -f "$jar_dest" ]]; then
-        echo "JAR already in app bundle"
-        return 0
-    fi
-
-    echo "Setting up LiteRT-LM Server JAR..."
-
-    local jar_source=""
-
-    # 1. Check for locally built JAR first
-    local local_jar
-    local_jar=$(ls -t "$PLUGIN_ROOT/litertlm-server/build/libs/"*-all.jar 2>/dev/null | head -n1)
-    if [[ -n "$local_jar" && -f "$local_jar" ]]; then
-        echo "Using locally built JAR: $local_jar"
-        jar_source="$local_jar"
-    fi
-
-    # 2. Try to build if JDK 21+ available
-    if [[ -z "$jar_source" ]]; then
-        echo "Checking for JDK 21+..."
-        local jdk_path
-        if jdk_path=$(find_build_jdk 2>/dev/null); then
-            echo "Using JDK: $jdk_path"
-            export JAVA_HOME="$(dirname "$(dirname "$jdk_path")")"
-            if jar_source=$(build_jar); then
-                echo "Built JAR successfully"
-            else
-                echo "Build failed, will try download..."
-                jar_source=""
-            fi
-        else
-            echo "JDK 21+ not found, will download JAR..."
-        fi
-    fi
-
-    # 3. Download as fallback
-    if [[ -z "$jar_source" ]]; then
-        # Check cache first
-        local cached_jar="$JAR_CACHE_DIR/$JAR_NAME"
-        if [[ -f "$cached_jar" ]]; then
-            echo "Using cached JAR"
-            jar_source="$cached_jar"
-        else
-            if jar_source=$(download_jar); then
-                echo "Downloaded JAR successfully"
-            else
-                echo "ERROR: Could not obtain JAR (build failed, download failed)"
-                exit 1
-            fi
-        fi
-    fi
-
-    # Copy to app bundle
-    echo "Copying JAR to app bundle..."
-    cp "$jar_source" "$jar_dest"
-
-    echo "JAR installed successfully"
-}
-
-# === Extract and sign native libraries ===
-extract_natives() {
-    local NATIVES_DIR="$FRAMEWORKS_DIR/litertlm"
-
-    # Check if already extracted (look for actual .so files, not marker)
-    if ls "$NATIVES_DIR"/*.so 1> /dev/null 2>&1; then
-        echo "Native libraries already installed"
-        return 0
-    fi
-
-    # Detect architecture for native library path
-    local NATIVE_ARCH
-    if [[ "$ARCH" == "arm64" ]]; then
-        NATIVE_ARCH="darwin-aarch64"
-    else
-        # Intel Mac (x86_64) is NOT supported by LiteRT-LM
-        # Google only provides native libraries for Apple Silicon
-        echo "WARNING: Intel Mac (x86_64) is not supported by LiteRT-LM"
-        echo "  LiteRT-LM only provides native libraries for Apple Silicon (arm64)"
-        echo "  Desktop support requires an Apple Silicon Mac (M1/M2/M3/M4)"
-        echo "  See: https://github.com/google-ai-edge/LiteRT-LM"
-        return 0
-    fi
-    local NATIVE_PATH="com/google/ai/edge/litertlm/jni/$NATIVE_ARCH"
-
-    local jar_path="$RESOURCES_DIR/$JAR_NAME"
-
-    if [[ ! -f "$jar_path" ]]; then
-        echo "JAR not found, skipping native extraction"
-        return 0
-    fi
-
-    echo "Extracting native libraries from JAR..."
-    echo "  Native path: $NATIVE_PATH"
-
-    # Create natives directory (remove old signed files if exist)
-    rm -rf "$NATIVES_DIR"
-    mkdir -p "$NATIVES_DIR"
-
-    # Extract to temp directory first (for path traversal protection)
-    local temp_dir
-    temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" EXIT
-
-    # Extract native libraries from JAR
-    unzip -o "$jar_path" "$NATIVE_PATH/*" -d "$temp_dir" 2>/dev/null || {
-        echo "WARNING: Could not extract native libraries (may not exist for this architecture)"
-        rm -rf "$temp_dir"
-        return 0
-    }
-
-    # Validate and copy only .so/.dylib files from expected location (path traversal protection)
-    local extracted_dir="$temp_dir/$NATIVE_PATH"
-    if [[ -d "$extracted_dir" ]]; then
-        local allowed_path
-        allowed_path=$(cd "$extracted_dir" && pwd)
-
-        find "$extracted_dir" -type f \( -name "*.so" -o -name "*.dylib" \) | while read -r file; do
-            local resolved_path
-            resolved_path=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
-
-            # Validate path is within expected directory (prevent path traversal)
-            if [[ "$resolved_path" == "$allowed_path"/* ]]; then
-                cp "$file" "$NATIVES_DIR/"
-                local filename
-                filename=$(basename "$file")
-                echo "  Extracted: $filename"
-
-                # Remove quarantine and sign
-                xattr -r -d com.apple.quarantine "$NATIVES_DIR/$filename" 2>/dev/null || true
-                codesign --force --sign - "$NATIVES_DIR/$filename"
-            else
-                echo "WARNING: Skipping suspicious path: $resolved_path"
-            fi
-        done
-    else
-        echo "WARNING: Native libraries not found in JAR at path: $NATIVE_PATH"
-    fi
-
-    # Cleanup
-    rm -rf "$temp_dir"
-    trap - EXIT
-
-    echo "Native libraries extracted and signed"
-}
-
-# === Remove quarantine (for development) ===
-remove_quarantine() {
-    echo "Removing quarantine attributes..."
-    xattr -r -d com.apple.quarantine "$JRE_DEST" 2>/dev/null || true
-    xattr -r -d com.apple.quarantine "$RESOURCES_DIR/$JAR_NAME" 2>/dev/null || true
-}
-
-# === Sign JRE binaries with sandbox inheritance ===
-sign_jre() {
-    echo "Signing JRE binaries..."
-
-    # Create child entitlements for sandbox inheritance
-    # Required for Java to run as subprocess in sandboxed macOS app
-    # See: https://developer.apple.com/forums/thread/706390
-    local CHILD_ENTITLEMENTS="$RESOURCES_DIR/java.entitlements"
-    cat > "$CHILD_ENTITLEMENTS" << 'ENTITLEMENTS'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.app-sandbox</key>
-    <true/>
-    <key>com.apple.security.inherit</key>
-    <true/>
-</dict>
-</plist>
-ENTITLEMENTS
-
-    # Sign all dylibs first (without entitlements)
-    find "$JRE_DEST" -type f -name "*.dylib" | while read -r file; do
-        codesign --force --sign - "$file" 2>/dev/null || true
+    for lib in "${PREBUILT_LIBS[@]}"; do
+        download_if_not_cached "$lib" "$NATIVES_DIR"
     done
-
-    # Sign java executable with sandbox inheritance entitlements
-    if [[ -f "$JRE_DEST/bin/java" ]]; then
-        echo "Signing java with sandbox inheritance entitlements..."
-        codesign --force --sign - --entitlements "$CHILD_ENTITLEMENTS" "$JRE_DEST/bin/java"
-    fi
-
-    # Sign other executables with inheritance entitlements
-    find "$JRE_DEST/bin" -type f -perm +111 ! -name "java" | while read -r file; do
-        if file "$file" | grep -q "Mach-O"; then
-            codesign --force --sign - --entitlements "$CHILD_ENTITLEMENTS" "$file" 2>/dev/null || true
-        fi
-    done
-
-    echo "JRE signed with sandbox inheritance"
 }
 
-# Run setup
-download_jre
-setup_jar
-extract_natives
-remove_quarantine
-sign_jre
+# ============================================================================
+# Main
+# ============================================================================
+install_prebuilt_libs
 
+# Summary
+echo ""
+echo "========================================"
 echo "=== Setup complete ==="
+echo "========================================"
+echo "Natives dir: $NATIVES_DIR"
+echo ""
+echo "Bundled libraries:"
+for f in "$NATIVES_DIR"/*.dylib; do
+    [ -f "$f" ] || continue
+    size=$(du -h "$f" | cut -f1)
+    echo "  $(basename "$f") ($size)"
+done

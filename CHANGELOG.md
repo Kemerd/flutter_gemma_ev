@@ -1,3 +1,8 @@
+## 0.13.0
+- **Native FFI Desktop**: Replace gRPC/Java with direct C API via Dart FFI
+- **Zero Java**: Remove litertlm-server, JRE, JAR — pure native on desktop
+- **Auto-download**: Prebuilt libs pulled from GitHub at build time
+
 ## 0.12.3
 - **Android LiteRT-LM Engine**: Added LiteRT-LM inference engine for Android
   - Automatic engine selection based on file extension (`.litertlm` → LiteRT-LM, `.task/.bin` → MediaPipe)
