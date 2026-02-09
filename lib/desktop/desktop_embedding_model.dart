@@ -68,28 +68,66 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     // -----------------------------------------------------------------
     // Configure TFLite interpreter options
     // -----------------------------------------------------------------
-    final options = InterpreterOptions()..threads = Platform.numberOfProcessors;
+    final cpuCount = Platform.numberOfProcessors;
+    final options = InterpreterOptions()..threads = cpuCount;
+    debugPrint('[DesktopEmbedding] InterpreterOptions created '
+        '(threads: $cpuCount)');
 
-    // XNNPack gives a nice speed boost on desktop CPUs
+    // XNNPack gives a nice speed boost on desktop CPUs.
     // GPU delegate is not reliably available on desktop via tflite_flutter,
     // so we always use CPU + XNNPack regardless of preferredBackend.
+    // NOTE: Some mixed-precision models may crash with XNNPack; if so we
+    //       retry without it below.
+    bool useXnnpack = true;
     try {
       options.addDelegate(XNNPackDelegate(
-        options: XNNPackDelegateOptions(numThreads: Platform.numberOfProcessors),
+        options: XNNPackDelegateOptions(numThreads: cpuCount),
       ));
-      debugPrint('[DesktopEmbedding] XNNPack delegate enabled '
-          '(${Platform.numberOfProcessors} threads)');
+      debugPrint('[DesktopEmbedding] XNNPack delegate enabled ($cpuCount threads)');
     } catch (e) {
-      // XNNPack not available — fall back to default CPU
+      useXnnpack = false;
       debugPrint('[DesktopEmbedding] XNNPack unavailable, using default CPU: $e');
     }
 
     // -----------------------------------------------------------------
-    // Load the TFLite model
+    // Load the TFLite model (with XNNPack fallback)
     // -----------------------------------------------------------------
     debugPrint('[DesktopEmbedding] Loading model from: $modelPath');
-    final interpreter = Interpreter.fromFile(File(modelPath), options: options);
+    final modelFile = File(modelPath);
+    if (!modelFile.existsSync()) {
+      throw FileSystemException('Model file not found', modelPath);
+    }
+    debugPrint('[DesktopEmbedding] Model file size: '
+        '${modelFile.lengthSync()} bytes');
+
+    // Read model into memory first — avoids potential file-handle issues
+    // in the native C library on Windows
+    debugPrint('[DesktopEmbedding] Reading model into memory...');
+    final modelBytes = await modelFile.readAsBytes();
+    debugPrint('[DesktopEmbedding] Model bytes read: ${modelBytes.length}');
+
+    late Interpreter interpreter;
+    try {
+      debugPrint('[DesktopEmbedding] Creating interpreter (XNNPack=$useXnnpack)...');
+      interpreter = Interpreter.fromBuffer(modelBytes, options: options);
+      debugPrint('[DesktopEmbedding] Interpreter created OK');
+    } catch (e) {
+      // If XNNPack was on and it crashed, retry without it
+      if (useXnnpack) {
+        debugPrint('[DesktopEmbedding] Interpreter failed with XNNPack, '
+            'retrying without delegate: $e');
+        final fallbackOptions = InterpreterOptions()..threads = cpuCount;
+        interpreter =
+            Interpreter.fromBuffer(modelBytes, options: fallbackOptions);
+        debugPrint('[DesktopEmbedding] Interpreter created OK (no delegate)');
+      } else {
+        rethrow;
+      }
+    }
+
+    debugPrint('[DesktopEmbedding] Allocating tensors...');
     interpreter.allocateTensors();
+    debugPrint('[DesktopEmbedding] Tensors allocated');
 
     // -----------------------------------------------------------------
     // Inspect tensor shapes so we work with any EmbeddingGemma variant
