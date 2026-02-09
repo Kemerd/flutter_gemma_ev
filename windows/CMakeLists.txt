@@ -1,7 +1,8 @@
 # Flutter Gemma Windows Plugin
 #
 # This CMakeLists.txt sets up the Windows plugin and runs a PowerShell script
-# to download JRE, copy JAR, and extract native libraries during build.
+# to download prebuilt LiteRT-LM native libraries during build.
+# No Java, no JRE, no JAR — pure native FFI.
 
 cmake_minimum_required(VERSION 3.14)
 
@@ -38,8 +39,8 @@ set(flutter_gemma_bundled_libraries
   PARENT_SCOPE
 )
 
-# === LiteRT-LM Desktop Setup ===
-# Run PowerShell script to download JRE, copy JAR, and extract natives
+# === LiteRT-LM Native Setup ===
+# Run PowerShell script to download prebuilt accelerator libraries + DXC
 
 # Get paths
 set(PLUGIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -50,87 +51,34 @@ set(SETUP_OUTPUT_DIR "${CMAKE_BINARY_DIR}/flutter_gemma_resources")
 add_custom_target(flutter_gemma_setup ALL
   COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${SETUP_SCRIPT}" -PluginDir "${PLUGIN_DIR}" -OutputDir "${SETUP_OUTPUT_DIR}"
   WORKING_DIRECTORY "${PLUGIN_DIR}"
-  COMMENT "Setting up LiteRT-LM Desktop (JRE, JAR, natives)..."
+  COMMENT "Setting up LiteRT-LM native libraries..."
   VERBATIM
 )
 
 # Ensure setup runs before plugin builds
 add_dependencies(${PLUGIN_NAME} flutter_gemma_setup)
 
-# === POST_BUILD: Copy files to runner directory ===
-# This ensures files are available when running `flutter run`
-#
-# IMPORTANT: On Windows with Visual Studio (multi-config generator),
+# === POST_BUILD: Copy native libraries to runner directory ===
+# On Windows with Visual Studio (multi-config generator),
 # CMAKE_BUILD_TYPE is EMPTY at configure time. The actual config
-# (Debug/Release) is determined at build time.
-# We MUST use $<CONFIG> generator expression which evaluates at build time.
+# (Debug/Release) is determined at build time via $<CONFIG>.
 
-# Base runner path (without config - $<CONFIG> adds Debug/Release at build time)
 set(RUNNER_BASE_DIR "${CMAKE_BINARY_DIR}/runner")
 
 message(STATUS "flutter_gemma: Runner base directory: ${RUNNER_BASE_DIR}")
 message(STATUS "flutter_gemma: Setup output: ${SETUP_OUTPUT_DIR}")
-message(STATUS "flutter_gemma: Config will be determined at build time via generator expression")
 
-# POST_BUILD: Copy JAR to runner's data directory
-add_custom_command(TARGET ${PLUGIN_NAME} POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${RUNNER_BASE_DIR}/$<CONFIG>/data"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "${SETUP_OUTPUT_DIR}/data/litertlm-server.jar"
-    "${RUNNER_BASE_DIR}/$<CONFIG>/data/litertlm-server.jar"
-  COMMENT "Copying litertlm-server.jar to runner/$<CONFIG>/data/..."
-  VERBATIM
-)
-
-# POST_BUILD: Copy JRE to runner directory (only if not exists)
-# Using PowerShell to check existence first - avoids errors when files are locked
+# POST_BUILD: Copy LiteRT-LM native libraries (DLLs + DXC)
 add_custom_command(TARGET ${PLUGIN_NAME} POST_BUILD
   COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
-    "if (-not (Test-Path '${RUNNER_BASE_DIR}/$<CONFIG>/jre/bin/java.exe')) { Write-Host 'Copying JRE...'; Copy-Item -Path '${SETUP_OUTPUT_DIR}/jre' -Destination '${RUNNER_BASE_DIR}/$<CONFIG>' -Recurse -Force } else { Write-Host 'JRE already exists, skipping copy' }"
-  COMMENT "Checking/copying JRE to runner/$<CONFIG>/jre/..."
-  VERBATIM
-)
-
-# POST_BUILD: Copy native libraries (if missing JNI DLL or DXC)
-add_custom_command(TARGET ${PLUGIN_NAME} POST_BUILD
-  COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
-    "if ((-not (Test-Path '${RUNNER_BASE_DIR}/$<CONFIG>/litertlm/litertlm_jni.dll')) -or (-not (Test-Path '${RUNNER_BASE_DIR}/$<CONFIG>/litertlm/dxil.dll'))) { Write-Host 'Copying native libraries...'; New-Item -ItemType Directory -Path '${RUNNER_BASE_DIR}/$<CONFIG>/litertlm' -Force | Out-Null; Copy-Item -Path '${SETUP_OUTPUT_DIR}/litertlm/*' -Destination '${RUNNER_BASE_DIR}/$<CONFIG>/litertlm' -Recurse -Force } else { Write-Host 'Native libraries already exist, skipping copy' }"
-  COMMENT "Checking/copying native libraries to runner/$<CONFIG>/litertlm/..."
+    "New-Item -ItemType Directory -Path '${RUNNER_BASE_DIR}/$<CONFIG>/litertlm' -Force | Out-Null; Copy-Item -Path '${SETUP_OUTPUT_DIR}/litertlm/*' -Destination '${RUNNER_BASE_DIR}/$<CONFIG>/litertlm' -Recurse -Force; Write-Host 'LiteRT-LM native libraries copied to runner/$<CONFIG>/litertlm/'"
+  COMMENT "Copying LiteRT-LM native libraries to runner/$<CONFIG>/litertlm/..."
   VERBATIM
 )
 
 # === Install rules for Release builds ===
-if(DEFINED INSTALL_BUNDLE_DATA_DIR AND NOT "${INSTALL_BUNDLE_DATA_DIR}" STREQUAL "")
-  # Install JAR to data directory
-  install(FILES "${SETUP_OUTPUT_DIR}/data/litertlm-server.jar"
-    DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
-    OPTIONAL
-  )
-endif()
-
+# Copy native libraries to the install bundle
 if(DEFINED CMAKE_INSTALL_PREFIX AND NOT "${CMAKE_INSTALL_PREFIX}" STREQUAL "")
-  # Install JRE to runner directory (only if not already there)
-  # Use RUNNER_BASE_DIR + config instead of CMAKE_INSTALL_PREFIX (which contains invalid generator expression)
-  install(CODE "
-    if(\"\${CMAKE_INSTALL_CONFIG_NAME}\" STREQUAL \"\")
-      set(CONFIG \"Release\")
-    else()
-      set(CONFIG \"\${CMAKE_INSTALL_CONFIG_NAME}\")
-    endif()
-
-    set(SRC_DIR \"${SETUP_OUTPUT_DIR}/jre\")
-    set(DST_DIR \"${RUNNER_BASE_DIR}/\${CONFIG}/jre\")
-    if(EXISTS \"\${SRC_DIR}\")
-      if(NOT EXISTS \"\${DST_DIR}/bin/java.exe\")
-        message(STATUS \"Installing JRE to \${DST_DIR}\")
-        file(COPY \"\${SRC_DIR}/\" DESTINATION \"\${DST_DIR}\")
-      else()
-        message(STATUS \"JRE already exists at \${DST_DIR}, skipping\")
-      endif()
-    endif()
-  ")
-
-  # Install native libraries (only if not already there)
   install(CODE "
     if(\"\${CMAKE_INSTALL_CONFIG_NAME}\" STREQUAL \"\")
       set(CONFIG \"Release\")
@@ -141,13 +89,9 @@ if(DEFINED CMAKE_INSTALL_PREFIX AND NOT "${CMAKE_INSTALL_PREFIX}" STREQUAL "")
     set(SRC_DIR \"${SETUP_OUTPUT_DIR}/litertlm\")
     set(DST_DIR \"${RUNNER_BASE_DIR}/\${CONFIG}/litertlm\")
     if(EXISTS \"\${SRC_DIR}\")
-      if(NOT EXISTS \"\${DST_DIR}/litertlm_jni.dll\")
-        message(STATUS \"Installing native libraries to \${DST_DIR}\")
-        file(MAKE_DIRECTORY \"\${DST_DIR}\")
-        file(COPY \"\${SRC_DIR}/\" DESTINATION \"\${DST_DIR}\")
-      else()
-        message(STATUS \"Native libraries already exist at \${DST_DIR}, skipping\")
-      endif()
+      message(STATUS \"Installing LiteRT-LM native libraries to \${DST_DIR}\")
+      file(MAKE_DIRECTORY \"\${DST_DIR}\")
+      file(COPY \"\${SRC_DIR}/\" DESTINATION \"\${DST_DIR}\")
     endif()
   ")
 endif()

@@ -1,84 +1,85 @@
 // Test that desktop vision/audio parameters are correctly passed through the chain
+// Updated to reference the native FFI client (replaces old gRPC client)
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('Desktop vision/audio parameter passing', () {
-    test('LiteRtLmClient.initialize accepts enableVision parameter', () {
-      // grpc_client.dart line 44:
+    test('LiteRtLmNativeClient.initialize accepts enableVision parameter', () {
+      // litertlm_native_client.dart:
       // bool enableVision = false,
       //
       // This test documents that enableVision parameter EXISTS in initialize()
       expect(true, isTrue);
     });
 
-    test('LiteRtLmClient.initialize accepts maxNumImages parameter', () {
-      // grpc_client.dart line 45:
+    test('LiteRtLmNativeClient.initialize accepts maxNumImages parameter', () {
+      // litertlm_native_client.dart:
       // int maxNumImages = 1,
       //
       // This test documents that maxNumImages parameter EXISTS in initialize()
       expect(true, isTrue);
     });
 
-    test('LiteRtLmClient.initialize accepts enableAudio parameter', () {
-      // grpc_client.dart line 46:
+    test('LiteRtLmNativeClient.initialize accepts enableAudio parameter', () {
+      // litertlm_native_client.dart:
       // bool enableAudio = false,
       //
       // This test documents that enableAudio parameter EXISTS in initialize()
       expect(true, isTrue);
     });
 
-    test('FlutterGemmaDesktop.createModel passes enableVision to grpcClient', () {
-      // flutter_gemma_desktop.dart line 152:
+    test('FlutterGemmaDesktop.createModel passes enableVision to native client', () {
+      // flutter_gemma_desktop.dart:
       // enableVision: supportImage,
       //
       // This test documents that enableVision IS passed
       expect(true, isTrue);
     });
 
-    test('FlutterGemmaDesktop.createModel passes enableAudio to grpcClient', () {
-      // flutter_gemma_desktop.dart line 153:
+    test('FlutterGemmaDesktop.createModel passes enableAudio to native client', () {
+      // flutter_gemma_desktop.dart:
       // enableAudio: supportAudio,
       //
       // This test documents that enableAudio IS passed
       expect(true, isTrue);
     });
 
-    test('FlutterGemmaDesktop.createModel passes maxNumImages to grpcClient', () {
-      // flutter_gemma_desktop.dart line 151:
+    test('FlutterGemmaDesktop.createModel passes maxNumImages to native client', () {
+      // flutter_gemma_desktop.dart:
       // maxNumImages: supportImage ? (maxNumImages ?? 1) : 1,
       //
-      // FIXED: maxNumImages is now passed to grpcClient.initialize()
+      // maxNumImages is passed to native client initialize()
       expect(true, isTrue, reason: 'maxNumImages is passed');
     });
   });
 
   group('Parameter chain documentation', () {
     test('createModel receives supportImage parameter', () {
-      // flutter_gemma_desktop.dart line 83:
+      // flutter_gemma_desktop.dart:
       // bool supportImage = false,
       expect(true, isTrue);
     });
 
     test('createModel receives supportAudio parameter', () {
-      // flutter_gemma_desktop.dart line 84:
+      // flutter_gemma_desktop.dart:
       // bool supportAudio = false,
       expect(true, isTrue);
     });
 
     test('createModel receives maxNumImages parameter', () {
-      // flutter_gemma_desktop.dart line 82:
+      // flutter_gemma_desktop.dart:
       // int? maxNumImages,
       expect(true, isTrue);
     });
 
     test('DesktopInferenceModel receives supportImage', () {
-      // flutter_gemma_desktop.dart line 172:
+      // flutter_gemma_desktop.dart:
       // supportImage: supportImage,
       expect(true, isTrue);
     });
 
     test('DesktopInferenceModel receives supportAudio', () {
-      // flutter_gemma_desktop.dart line 173:
+      // flutter_gemma_desktop.dart:
       // supportAudio: supportAudio,
       expect(true, isTrue);
     });

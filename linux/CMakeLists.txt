@@ -1,7 +1,8 @@
 # Flutter Gemma Linux Plugin
 #
 # This CMakeLists.txt sets up the Linux plugin and runs a bash script
-# to download JRE, copy JAR, and extract native libraries during build.
+# to download prebuilt LiteRT-LM native libraries during build.
+# No Java, no JRE, no JAR — pure native FFI.
 
 cmake_minimum_required(VERSION 3.14)
 
@@ -28,10 +29,11 @@ target_include_directories(${PLUGIN_NAME} PUBLIC
 
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 
-# Empty bundled libraries (we copy manually via POST_BUILD)
+# Empty bundled libraries (we copy manually via install step)
 set(flutter_gemma_bundled_libraries "" PARENT_SCOPE)
 
-# === LiteRT-LM Desktop Setup ===
+# === LiteRT-LM Native Setup ===
+# Run bash script to download prebuilt accelerator libraries
 set(PLUGIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(SETUP_SCRIPT "${PLUGIN_DIR}/scripts/setup_desktop.sh")
 set(SETUP_OUTPUT_DIR "${CMAKE_BINARY_DIR}/flutter_gemma_resources")
@@ -40,35 +42,21 @@ set(SETUP_OUTPUT_DIR "${CMAKE_BINARY_DIR}/flutter_gemma_resources")
 add_custom_target(flutter_gemma_setup ALL
   COMMAND bash "${SETUP_SCRIPT}" "${PLUGIN_DIR}" "${SETUP_OUTPUT_DIR}"
   WORKING_DIRECTORY "${PLUGIN_DIR}"
-  COMMENT "Setting up LiteRT-LM Desktop (JRE, JAR, natives)..."
+  COMMENT "Setting up LiteRT-LM native libraries..."
   VERBATIM
 )
 
 add_dependencies(${PLUGIN_NAME} flutter_gemma_setup)
 
-# === Install: Copy files to bundle ===
-# Linux bundle structure: bundle/data/, bundle/lib/
-# Use install(CODE) to copy at install time with proper paths
-
+# === Install: Copy native libraries to bundle ===
+# Linux bundle structure: bundle/lib/
 install(CODE "
   set(BUNDLE_DIR \"${CMAKE_BINARY_DIR}/bundle\")
   set(SETUP_DIR \"${SETUP_OUTPUT_DIR}\")
 
-  # Copy JAR
-  if(EXISTS \"\${SETUP_DIR}/data/litertlm-server.jar\")
-    file(COPY \"\${SETUP_DIR}/data/litertlm-server.jar\" DESTINATION \"\${BUNDLE_DIR}/data\")
-    message(STATUS \"Installed litertlm-server.jar to bundle/data/\")
-  endif()
-
-  # Copy JRE
-  if(EXISTS \"\${SETUP_DIR}/jre\")
-    file(COPY \"\${SETUP_DIR}/jre\" DESTINATION \"\${BUNDLE_DIR}/lib\")
-    message(STATUS \"Installed JRE to bundle/lib/jre/\")
-  endif()
-
-  # Copy native libraries
+  # Copy native libraries (accelerator DLLs, etc.)
   if(EXISTS \"\${SETUP_DIR}/litertlm\")
     file(COPY \"\${SETUP_DIR}/litertlm\" DESTINATION \"\${BUNDLE_DIR}/lib\")
-    message(STATUS \"Installed native libs to bundle/lib/litertlm/\")
+    message(STATUS \"Installed LiteRT-LM native libs to bundle/lib/litertlm/\")
   endif()
 ")
