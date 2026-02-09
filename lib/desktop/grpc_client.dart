@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 import 'package:grpc/grpc.dart';
@@ -56,7 +57,7 @@ class LiteRtLmClient {
     debugPrint('[LiteRtLmClient]   maxNumImages: $maxNumImages');
 
     final request = InitializeRequest()
-      ..modelPath = modelPath
+      ..modelPath = modelPath 
       ..backend = backend
       ..maxTokens = maxTokens
       ..enableVision = enableVision

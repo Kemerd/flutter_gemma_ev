@@ -32,12 +32,15 @@ dependencies {
 }
 
 java {
-    // Use whatever Java is available (17+)
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    // Auto-provision JDK 21 via Gradle toolchain if not available locally.
+    // This downloads a compatible JDK automatically so developers only need
+    // a JRE 17+ (or any Java) to kick off the build.
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
 }
 
-// Don't use Kotlin toolchain - use system Java
+// Kotlin JVM target must match the Java toolchain version
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)

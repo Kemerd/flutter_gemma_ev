@@ -42,12 +42,22 @@ class LiteRtLmServiceImpl : LiteRtLmServiceGrpcKt.LiteRtLmServiceCoroutineImplBa
         }
 
         val modelFile = File(request.modelPath)
+
         if (!modelFile.exists()) {
             return InitializeResponse.newBuilder()
                 .setSuccess(false)
                 .setError("Model file not found: ${request.modelPath}")
                 .build()
         }
+
+        // Resolve to canonical path — this is critical on Windows where the
+        // LiteRT-LM JNI native code fails with raw Windows paths (drive
+        // letters, backslashes). canonicalPath resolves symlinks, normalizes
+        // separators, and produces the OS-native absolute path that the C++
+        // layer can actually open.
+        val canonicalModelPath = modelFile.canonicalPath
+        logger.info("Canonical model path: $canonicalModelPath (original: ${request.modelPath})")
+        logger.info("Model file size: ${modelFile.length()} bytes")
 
         // Use mutex to protect engine state
         return engineMutex.withLock {
@@ -66,13 +76,15 @@ class LiteRtLmServiceImpl : LiteRtLmServiceGrpcKt.LiteRtLmServiceCoroutineImplBa
                 val visionBackend = if (request.maxNumImages > 0) backend else null
                 val audioBackend = if (request.enableAudio) Backend.CPU else null
 
-                // Use model directory as cache dir (like Android does)
-                val cacheDir = modelFile.parentFile?.absolutePath
+                // Use system temp for cache dir (matches Android's context.cacheDir
+                // pattern). Using the model's parent dir can fail if it's read-only
+                // or on a path the native code can't write to.
+                val cacheDir = System.getProperty("java.io.tmpdir")
 
                 logger.info("Creating EngineConfig: backend=$backend, visionBackend=$visionBackend, audioBackend=$audioBackend, maxTokens=${request.maxTokens}, cacheDir=$cacheDir")
 
                 val engineConfig = EngineConfig(
-                    modelPath = request.modelPath,
+                    modelPath = canonicalModelPath,
                     backend = backend,
                     maxNumTokens = request.maxTokens,
                     visionBackend = visionBackend,

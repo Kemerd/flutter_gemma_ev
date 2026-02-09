@@ -24,8 +24,8 @@ class ServerProcessManager {
   bool _cleanupRegistered = false;
 
   /// Register signal handlers for graceful shutdown.
-  /// Each signal is wrapped independently because Windows supports SIGINT
-  /// but throws SignalException for SIGTERM (errno 50).
+  /// Windows only supports SIGINT — SIGTERM throws a SignalException that
+  /// can escape try-catch (async zone error). We skip it entirely on Windows.
   void _registerCleanupHandlers() {
     if (_cleanupRegistered) return;
     _cleanupRegistered = true;
@@ -40,15 +40,18 @@ class ServerProcessManager {
       debugPrint('[ServerProcessManager] SIGINT handler not available: $e');
     }
 
-    // SIGTERM - NOT supported on Windows, wrap separately to avoid
-    // taking down the SIGINT handler when this throws
-    try {
-      ProcessSignal.sigterm.watch().listen((_) {
-        debugPrint('[ServerProcessManager] Received SIGTERM, cleaning up...');
-        stop();
-      });
-    } catch (e) {
-      debugPrint('[ServerProcessManager] SIGTERM handler not available: $e');
+    // SIGTERM - completely unsupported on Windows (throws SignalException
+    // errno 50 that can escape synchronous try-catch). Only register on
+    // platforms that actually support it.
+    if (!Platform.isWindows) {
+      try {
+        ProcessSignal.sigterm.watch().listen((_) {
+          debugPrint('[ServerProcessManager] Received SIGTERM, cleaning up...');
+          stop();
+        });
+      } catch (e) {
+        debugPrint('[ServerProcessManager] SIGTERM handler not available: $e');
+      }
     }
   }
 
