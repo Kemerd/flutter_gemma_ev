@@ -392,30 +392,101 @@ class LiteRtLmNativeClient {
     // Controller to bridge native callbacks → Dart stream
     final controller = StreamController<String>();
 
+    // -----------------------------------------------------------------------
+    // UTF-8 accumulation buffer
+    // -----------------------------------------------------------------------
+    // Small LLMs sometimes emit tokens that split a multi-byte UTF-8
+    // character across two consecutive callbacks (e.g. byte 1 of a 3-byte
+    // sequence in one token, bytes 2-3 in the next). Calling toDartString()
+    // on either chunk alone throws a FormatException because the bytes are
+    // individually invalid UTF-8.
+    //
+    // Solution: read raw bytes from the native pointer, append to a buffer,
+    // decode only the longest valid UTF-8 prefix, and carry any trailing
+    // incomplete bytes forward to the next callback. On the final callback
+    // we flush whatever remains with allowMalformed so nothing is lost.
+    // -----------------------------------------------------------------------
+    final pendingBytes = <int>[];
+
     // Create the native-callable wrapper that forwards callbacks to Dart.
     // NativeCallable.listener is safe to call from any thread — it posts
     // the invocation to the Dart isolate's event loop.
     final nativeCallback = NativeCallable<LiteRtLmStreamCallbackNative>.listener(
       (Pointer<Void> callbackData, Pointer<Utf8> chunk, bool isFinal,
           Pointer<Utf8> errorMsg) {
-        // Check for errors
+        // Check for errors — error messages are ASCII-safe, direct decode OK
         if (errorMsg != nullptr) {
-          final error = errorMsg.toDartString();
-          if (error.isNotEmpty) {
-            controller.addError(Exception('LiteRT-LM error: $error'));
+          try {
+            final error = errorMsg.toDartString();
+            if (error.isNotEmpty) {
+              controller.addError(Exception('LiteRT-LM error: $error'));
+            }
+          } catch (_) {
+            // Even error string was malformed — emit generic error
+            controller.addError(Exception('LiteRT-LM error (undecodable)'));
           }
         }
 
-        // Emit the chunk text if present
+        // Accumulate raw bytes from the chunk pointer and emit only
+        // complete UTF-8 characters, carrying partial tails forward.
         if (chunk != nullptr) {
-          final text = chunk.toDartString();
-          if (text.isNotEmpty) {
-            controller.add(text);
+          // Read raw bytes from native pointer (scan for null terminator)
+          final bytePtr = chunk.cast<Uint8>();
+          var len = 0;
+          while (bytePtr[len] != 0) {
+            len++;
+          }
+
+          if (len > 0) {
+            // Append this chunk's bytes to the pending buffer
+            for (var i = 0; i < len; i++) {
+              pendingBytes.add(bytePtr[i]);
+            }
+
+            // Find where the last potentially-incomplete UTF-8 char starts
+            final validEnd = _findValidUtf8End(pendingBytes);
+
+            if (validEnd > 0) {
+              // Decode the complete portion and emit it
+              final text = utf8.decode(
+                pendingBytes.sublist(0, validEnd),
+                allowMalformed: true,
+              );
+
+              // Keep only the trailing incomplete bytes (if any)
+              if (validEnd < pendingBytes.length) {
+                final tail = pendingBytes.sublist(validEnd);
+                pendingBytes
+                  ..clear()
+                  ..addAll(tail);
+              } else {
+                pendingBytes.clear();
+              }
+
+              // Filter out native engine debug/error messages that
+              // occasionally leak into the token stream (e.g. "Buffer
+              // requirements not found for tensor 0x..."). These are
+              // internal LiteRT-LM diagnostics, not actual model output.
+              if (text.isNotEmpty && !_isEngineNoise(text)) {
+                controller.add(text);
+              }
+            }
+            // If validEnd == 0, all bytes are continuation bytes or an
+            // incomplete lead — keep buffering until more data arrives.
           }
         }
 
         // Close the stream when we receive the final marker
         if (isFinal) {
+          // Flush any remaining buffered bytes (with allowMalformed so
+          // we never throw, at worst we get U+FFFD replacements)
+          if (pendingBytes.isNotEmpty) {
+            final remaining = utf8.decode(pendingBytes, allowMalformed: true);
+            if (remaining.isNotEmpty) {
+              controller.add(remaining);
+            }
+            pendingBytes.clear();
+          }
           controller.close();
         }
       },
@@ -456,6 +527,96 @@ class LiteRtLmNativeClient {
       // Clean up native resources
       calloc.free(messagePtr);
       nativeCallback.close();
+    }
+  }
+
+  // ==========================================================================
+  // Engine Noise Filtering
+  // ==========================================================================
+
+  /// Detect native engine debug/error messages that leak into the token
+  /// stream. The LiteRT-LM engine occasionally emits internal diagnostics
+  /// (e.g. tensor buffer warnings, memory addresses) through the token
+  /// callback instead of through its own logging system. These should be
+  /// silently dropped rather than forwarded to the application as model text.
+  ///
+  /// Patterns are intentionally broad enough to catch variants but narrow
+  /// enough to avoid false positives on real model output.
+  static bool _isEngineNoise(String text) {
+    // "Buffer requirements not found for tensor 0x..."
+    if (text.contains('Buffer requirements not found')) return true;
+
+    // Bare hex memory addresses (e.g. "0x26904d4b090") — the engine
+    // sometimes emits these on their own as separate tokens
+    if (RegExp(r'^0x[0-9a-fA-F]{6,}$').hasMatch(text.trim())) return true;
+
+    return false;
+  }
+
+  // ==========================================================================
+  // UTF-8 Byte-Boundary Detection
+  // ==========================================================================
+
+  /// Find the byte offset where the last complete UTF-8 character ends.
+  ///
+  /// Returns the number of leading bytes in [bytes] that form complete,
+  /// well-formed UTF-8 characters. Any trailing bytes that are part of an
+  /// incomplete multi-byte sequence are excluded — the caller should carry
+  /// them forward and prepend them to the next chunk's bytes.
+  ///
+  /// UTF-8 encoding reference:
+  ///   1-byte:  0xxxxxxx                              (U+0000..U+007F)
+  ///   2-byte:  110xxxxx  10xxxxxx                     (U+0080..U+07FF)
+  ///   3-byte:  1110xxxx  10xxxxxx  10xxxxxx           (U+0800..U+FFFF)
+  ///   4-byte:  11110xxx  10xxxxxx  10xxxxxx  10xxxxxx (U+10000..U+10FFFF)
+  ///
+  /// Continuation bytes always match 10xxxxxx (0x80..0xBF).
+  /// A leading byte's top bits tell us how many continuation bytes follow.
+  static int _findValidUtf8End(List<int> bytes) {
+    if (bytes.isEmpty) return 0;
+
+    // Walk backwards from the end to find the start of the last character.
+    // Skip past any continuation bytes (10xxxxxx pattern).
+    var i = bytes.length - 1;
+    while (i >= 0 && (bytes[i] & 0xC0) == 0x80) {
+      i--;
+    }
+
+    // If we walked past the beginning, every byte is a continuation byte
+    // (orphaned) — nothing is safely decodable yet, buffer everything.
+    if (i < 0) return 0;
+
+    // Determine the expected byte-length of the character starting at [i]
+    final leadByte = bytes[i];
+    int expectedLength;
+
+    if ((leadByte & 0x80) == 0) {
+      // 0xxxxxxx — single-byte ASCII, always complete
+      expectedLength = 1;
+    } else if ((leadByte & 0xE0) == 0xC0) {
+      // 110xxxxx — 2-byte sequence
+      expectedLength = 2;
+    } else if ((leadByte & 0xF0) == 0xE0) {
+      // 1110xxxx — 3-byte sequence
+      expectedLength = 3;
+    } else if ((leadByte & 0xF8) == 0xF0) {
+      // 11110xxx — 4-byte sequence
+      expectedLength = 4;
+    } else {
+      // Invalid leading byte (0xF8+ or stray continuation) — skip it
+      // and treat everything before it as the valid prefix.
+      return i;
+    }
+
+    // Check if we have all the continuation bytes for this character
+    final actualLength = bytes.length - i;
+    if (actualLength >= expectedLength) {
+      // The last character is complete — all bytes are valid
+      return bytes.length;
+    } else {
+      // Incomplete character — return everything up to (but not including)
+      // the partial character's leading byte
+      return i;
     }
   }
 
