@@ -220,12 +220,13 @@ if ($sourceContent -notmatch [regex]::Escape($dispatchDeclMarker)) {
 void litert_lm_engine_settings_set_dispatch_lib_dir(
     LiteRtLmEngineSettings* settings, const char* dir) {
   if (settings && settings->settings && dir) {
+    // Set on main executor — this is where the GPU/WebGPU accelerator
+    // (libLiteRtWebGpuAccelerator.dll) gets loaded from.
     settings->settings->GetMutableMainExecutorSettings()
         .SetLitertDispatchLibDir(dir);
-    // Also set it on the vision executor if present, so the GPU accelerator
-    // can be found when loading the vision encoder.
-    auto* vision = settings->settings->GetMutableVisionExecutorSettings();
-    if (vision) {
+    // Also set on vision executor if it exists (returns std::optional).
+    auto vision = settings->settings->GetMutableVisionExecutorSettings();
+    if (vision.has_value()) {
       vision->SetLitertDispatchLibDir(dir);
     }
   }
