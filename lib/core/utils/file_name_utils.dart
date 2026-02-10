@@ -92,7 +92,10 @@ class FileNameUtils {
   ///
   /// Returns: true if extension is for small files, false otherwise
   static bool isSmallFile(String extension) {
-    const smallFileExtensions = ['.json', '.model'];
+    // .json / .model — config and tokenizer files (always small)
+    // .onnx — ONNX graph files can be tiny (~500KB) when using external data
+    //         format (.onnx_data holds the actual weights separately)
+    const smallFileExtensions = ['.json', '.model', '.onnx'];
     return smallFileExtensions.contains(extension);
   }
 
