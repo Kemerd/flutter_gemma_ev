@@ -102,7 +102,7 @@ class FileNameUtils {
   /// Gets minimum file size based on extension
   ///
   /// Returns appropriate minimum size threshold for file validation:
-  /// - Small files (.json, .model): 1KB (1024 bytes)
+  /// - Small files (.json, .model, .onnx): 1KB (1024 bytes)
   /// - Model files (all others): 1MB (1048576 bytes)
   ///
   /// This helps detect corrupted or incomplete downloads.
