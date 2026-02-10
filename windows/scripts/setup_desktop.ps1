@@ -59,9 +59,11 @@ $PluginRoot = Split-Path -Parent $PluginDir
 $PrebuiltLibs = @(
     "litert_lm_capi.dll",
     "libGemmaModelConstraintProvider.dll",
-    "libLiteRt.dll",
-    "libLiteRtTopKWebGpuSampler.dll",
-    "libLiteRtWebGpuAccelerator.dll"
+    "libLiteRt.dll"
+    # WebGPU accelerator DLLs skipped — GPU/vision disabled for now.
+    # Re-add these when GPU support is stable on Windows:
+    #   "libLiteRtTopKWebGpuSampler.dll",
+    #   "libLiteRtWebGpuAccelerator.dll"
 )
 
 # Local cache so we don't re-download every build
@@ -206,7 +208,9 @@ function Install-DXC {
 # ============================================================================
 try {
     Install-PrebuiltLibs
-    Install-DXC
+    # DXC (DirectX Shader Compiler) skipped — only needed for WebGPU/GPU backend.
+    # Re-enable when GPU support is stable on Windows:
+    # Install-DXC
 
     # Summary
     Write-Host ""

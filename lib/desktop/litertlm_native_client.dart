@@ -277,19 +277,17 @@ class LiteRtLmNativeClient {
     }
 
     try {
-      // Set sampler parameters if any were provided
+      // Set sampler parameters if any were provided.
+      // NOTE: The LiteRT-LM engine ONLY supports topP (type 2) sampling.
+      // topK (type 1) and greedy (type 3) both return UNIMPLEMENTED.
+      // The model metadata itself specifies TOP_P with p=0.95 as default,
+      // so this is the correct sampler type regardless.
       if (temperature != null || topK != null || topP != null) {
         final samplerParams = calloc<LiteRtLmSamplerParams>();
         try {
-          // Determine sampler type based on provided parameters
-          if (topP != null) {
-            samplerParams.ref.type = SamplerType.topP;
-          } else if (topK != null && topK > 1) {
-            samplerParams.ref.type = SamplerType.topK;
-          } else {
-            samplerParams.ref.type = SamplerType.topK;
-          }
-
+          // Always use topP — it's the only sampler the engine supports.
+          // For greedy-like behaviour, set topP close to 0 and temperature low.
+          samplerParams.ref.type = SamplerType.topP;
           samplerParams.ref.topK = topK ?? 40;
           samplerParams.ref.topP = topP ?? 0.95;
           samplerParams.ref.temperature = temperature ?? 0.8;
