@@ -70,7 +70,12 @@ $PrebuiltLibs = @(
 $CacheDir = "$env:LOCALAPPDATA\flutter_gemma\prebuilt\$NativeArch"
 
 # Output directory for bundled natives
+# Clean the output directory each time so stale DLLs from previous configs
+# (e.g. WebGPU libs that were later removed) don't persist across builds.
 $NativesDir = "$OutputDir\litertlm"
+if (Test-Path $NativesDir) {
+    Remove-Item -Recurse -Force -Path $NativesDir
+}
 New-Item -ItemType Directory -Force -Path $NativesDir | Out-Null
 New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
 
