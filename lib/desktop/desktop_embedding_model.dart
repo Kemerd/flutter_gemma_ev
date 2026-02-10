@@ -21,6 +21,13 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   // Fields
   // -------------------------------------------------------------------------
   final Interpreter _interpreter;
+
+  /// IsolateInterpreter runs TFLite inference in a background isolate,
+  /// preventing the main (UI) thread from blocking during the FFI call.
+  /// Without this, every _interpreter.run() freezes the UI for the
+  /// duration of model inference (~50-200ms per page on desktop CPU).
+  final IsolateInterpreter _isolateInterpreter;
+
   final SentencePieceTokenizer _tokenizer;
   final int _maxSeqLength;
   final int _embeddingDim;
@@ -30,12 +37,14 @@ class DesktopEmbeddingModel extends EmbeddingModel {
 
   DesktopEmbeddingModel._({
     required Interpreter interpreter,
+    required IsolateInterpreter isolateInterpreter,
     required SentencePieceTokenizer tokenizer,
     required int maxSeqLength,
     required int embeddingDim,
     required int inputCount,
     required this.onClose,
   })  : _interpreter = interpreter,
+        _isolateInterpreter = isolateInterpreter,
         _tokenizer = tokenizer,
         _maxSeqLength = maxSeqLength,
         _embeddingDim = embeddingDim,
@@ -142,8 +151,22 @@ class DesktopEmbeddingModel extends EmbeddingModel {
         'Embedding dim: $embeddingDim');
     debugPrint('[DesktopEmbedding] Model has $inputCount input tensor(s)');
 
+    // ---------------------------------------------------------------
+    // Wrap the interpreter in an IsolateInterpreter so inference runs
+    // on a background isolate instead of blocking the UI thread.
+    // The address is the raw pointer to the underlying TFLite C struct.
+    // ---------------------------------------------------------------
+    debugPrint('[DesktopEmbedding] Creating IsolateInterpreter for '
+        'non-blocking inference...');
+    final isolateInterpreter = await IsolateInterpreter.create(
+      address: interpreter.address,
+    );
+    debugPrint('[DesktopEmbedding] IsolateInterpreter ready — '
+        'inference will NOT block the UI thread');
+
     return DesktopEmbeddingModel._(
       interpreter: interpreter,
+      isolateInterpreter: isolateInterpreter,
       tokenizer: tokenizer,
       maxSeqLength: maxSeqLength,
       embeddingDim: embeddingDim,
@@ -181,8 +204,10 @@ class DesktopEmbeddingModel extends EmbeddingModel {
 
     if (_inputCount == 1) {
       // Single input: just token IDs
+      // Uses IsolateInterpreter so inference runs on a background isolate,
+      // keeping the UI thread completely free to render frames.
       final output = [List<double>.filled(_embeddingDim, 0.0)];
-      _interpreter.run(inputIds, output);
+      await _isolateInterpreter.run(inputIds, output);
       return output[0];
     } else {
       // Multiple inputs: token_ids + attention_mask (+ token_type_ids)
@@ -200,11 +225,12 @@ class DesktopEmbeddingModel extends EmbeddingModel {
         inputs.add([List<int>.filled(_maxSeqLength, 0)]);
       }
 
-      // Run with multiple inputs
+      // Run with multiple inputs via IsolateInterpreter (non-blocking).
+      // The actual TFLite FFI call happens on a background isolate.
       final outputs = <int, Object>{
         0: [List<double>.filled(_embeddingDim, 0.0)],
       };
-      _interpreter.runForMultipleInputs(inputs, outputs);
+      await _isolateInterpreter.runForMultipleInputs(inputs, outputs);
 
       return (outputs[0]! as List<List<double>>)[0];
     }
@@ -234,6 +260,9 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     if (_isClosed) return;
     _isClosed = true;
 
+    // Close the isolate interpreter first (stops the background isolate),
+    // then close the underlying interpreter (frees native TFLite resources).
+    await _isolateInterpreter.close();
     _interpreter.close();
     onClose();
 
