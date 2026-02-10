@@ -166,12 +166,21 @@ if ($buildContent -match [regex]::Escape($marker)) {
 # Backup original (clean) BUILD file
 Copy-Item -Path $BuildFile -Destination $BuildBackup -Force
 
-# Create stub source file (Bazel cc_binary needs at least one source)
+# Create stub source file that explicitly references every C API function.
+# This is the nuclear option: even if alwayslink is defeated by Bazel flags
+# (--legacy_whole_archive=0, /OPT:REF, etc.), the linker MUST keep these
+# symbols because they are directly referenced from this translation unit.
 @"
+// =======================================================================
 // LiteRT-LM C API shared library entry point.
-// All C API symbols are defined in engine.cc and exported via
-// __declspec(dllexport) / __attribute__((visibility("default"))).
-// This file exists only because Bazel cc_binary requires at least one source.
+// This stub forces the linker to include every exported C API symbol by
+// taking their addresses into a volatile array. Without this, MSVC's
+// /OPT:REF + Bazel's --legacy_whole_archive=0 can strip engine.obj
+// from the final DLL even with alwayslink = True.
+// =======================================================================
+
+#include "engine.h"
+#include <stddef.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -180,14 +189,56 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     return TRUE;
 }
 #endif
+
+// Force the linker to keep every C API symbol by referencing them.
+// The volatile qualifier prevents the compiler from optimising this away.
+volatile const void* litert_lm_force_exports[] = {
+    (const void*)&litert_lm_set_min_log_level,
+    (const void*)&litert_lm_engine_settings_create,
+    (const void*)&litert_lm_engine_settings_delete,
+    (const void*)&litert_lm_engine_settings_set_max_num_tokens,
+    (const void*)&litert_lm_engine_settings_set_cache_dir,
+    (const void*)&litert_lm_engine_settings_set_activation_data_type,
+    (const void*)&litert_lm_engine_settings_enable_benchmark,
+    (const void*)&litert_lm_engine_create,
+    (const void*)&litert_lm_engine_delete,
+    (const void*)&litert_lm_engine_create_session,
+    (const void*)&litert_lm_session_delete,
+    (const void*)&litert_lm_session_generate_content,
+    (const void*)&litert_lm_session_generate_content_stream,
+    (const void*)&litert_lm_session_get_benchmark_info,
+    (const void*)&litert_lm_session_config_create,
+    (const void*)&litert_lm_session_config_set_max_output_tokens,
+    (const void*)&litert_lm_session_config_set_sampler_params,
+    (const void*)&litert_lm_session_config_delete,
+    (const void*)&litert_lm_responses_delete,
+    (const void*)&litert_lm_responses_get_num_candidates,
+    (const void*)&litert_lm_responses_get_response_text_at,
+    (const void*)&litert_lm_conversation_config_create,
+    (const void*)&litert_lm_conversation_config_delete,
+    (const void*)&litert_lm_conversation_create,
+    (const void*)&litert_lm_conversation_delete,
+    (const void*)&litert_lm_conversation_send_message,
+    (const void*)&litert_lm_conversation_send_message_stream,
+    (const void*)&litert_lm_conversation_cancel_process,
+    (const void*)&litert_lm_conversation_get_benchmark_info,
+    (const void*)&litert_lm_json_response_delete,
+    (const void*)&litert_lm_json_response_get_string,
+    (const void*)&litert_lm_benchmark_info_delete,
+    (const void*)&litert_lm_benchmark_info_get_time_to_first_token,
+    (const void*)&litert_lm_benchmark_info_get_num_prefill_turns,
+    (const void*)&litert_lm_benchmark_info_get_num_decode_turns,
+    (const void*)&litert_lm_benchmark_info_get_prefill_token_count_at,
+    (const void*)&litert_lm_benchmark_info_get_decode_token_count_at,
+    (const void*)&litert_lm_benchmark_info_get_prefill_tokens_per_sec_at,
+    (const void*)&litert_lm_benchmark_info_get_decode_tokens_per_sec_at,
+};
 "@ | Set-Content -Path $StubFile -Encoding UTF8
 
 # Append shared library target to BUILD file.
 # The "engine_alwayslink" wrapper forces the linker to include ALL objects
-# from the :engine cc_library, even though capi_dll_entry.cc doesn't
-# reference them directly. Without this, MSVC's linker performs garbage
-# collection and drops engine.obj entirely, which means the C API functions
-# (marked __declspec(dllexport) in engine.h) never make it into the DLL.
+# from the :engine cc_library. Combined with the explicit references in
+# capi_dll_entry.cc above, this guarantees all C API symbols are exported.
 @"
 
 # ======================================================================
