@@ -152,6 +152,9 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     // has external data (model_q4.onnx_data). fromFile() lets the runtime
     // auto-resolve the companion .onnx_data file from the same directory.
     debugPrint('[DesktopEmbedding] Loading ONNX model from: $modelPath');
+    debugPrint('[DesktopEmbedding] Path codeUnits: ${modelPath.codeUnits}');
+    debugPrint('[DesktopEmbedding] Path length: ${modelPath.length}');
+    debugPrint('[DesktopEmbedding] Platform.isWindows: ${Platform.isWindows}');
     final modelFile = File(modelPath);
     if (!modelFile.existsSync()) {
       throw FileSystemException('Model file not found', modelPath);
@@ -159,6 +162,18 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     debugPrint('[DesktopEmbedding] Model file size: '
         '${modelFile.lengthSync()} bytes');
 
+    // Check companion .onnx_data file exists in the same directory
+    final dataFilePath = '${modelPath}_data';
+    final dataFile = File(dataFilePath);
+    if (dataFile.existsSync()) {
+      debugPrint('[DesktopEmbedding] Companion data file found: $dataFilePath '
+          '(${(dataFile.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB)');
+    } else {
+      debugPrint('[DesktopEmbedding] WARNING: No companion data file at: '
+          '$dataFilePath — model may fail if it references external data');
+    }
+
+    debugPrint('[DesktopEmbedding] Creating OrtSession.fromFile()...');
     final session = OrtSession.fromFile(modelFile, sessionOptions);
     debugPrint('[DesktopEmbedding] OrtSession created successfully');
 
@@ -171,15 +186,22 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     debugPrint('[DesktopEmbedding] Input tensors: $inputNames');
     debugPrint('[DesktopEmbedding] Output tensors: $outputNames');
 
-    // Determine sequence length and embedding dimension by running a
-    // probe inference with a dummy input. ONNX models with dynamic axes
-    // don't expose shapes statically, so we infer them from actual output.
-    // We use a sequence length of 256 (EmbeddingGemma's standard) and
-    // detect the embedding dimension from the output shape.
-    const probeSeqLength = 256;
-    final outputName = outputNames.first;
+    // Determine which output tensor to use for the embedding vector.
+    // EmbeddingGemma ONNX has two outputs:
+    //   - "last_hidden_state"   [1, seq_len, 768] — full transformer output
+    //   - "sentence_embedding"  [1, 768]           — pooled embedding (what we want)
+    // We prefer "sentence_embedding" if available; fall back to first output.
+    const preferredOutputName = 'sentence_embedding';
+    final outputName = outputNames.contains(preferredOutputName)
+        ? preferredOutputName
+        : outputNames.first;
+    debugPrint('[DesktopEmbedding] Using output tensor: "$outputName" '
+        '(available: $outputNames)');
 
-    // Run a quick probe to discover the embedding dimension
+    // Run a probe inference to discover the embedding dimension at runtime.
+    // ONNX models with dynamic axes don't expose shapes statically.
+    const probeSeqLength = 256;
+
     final probeTokens = Int64List(probeSeqLength);
     probeTokens[0] = tokenizer.bosId; // BOS token, rest are zeros (padding)
     final probeInput = OrtValueTensor.createTensorWithDataList(
@@ -213,15 +235,23 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     }
 
     final runOptions = OrtRunOptions();
-    final probeOutputs = session.run(runOptions, probeInputs);
 
-    // Extract embedding dimension from the probe output
+    // Only request our chosen output tensor (not all of them)
+    final probeOutputs = session.run(runOptions, probeInputs, [outputName]);
+
+    // Extract embedding dimension from the probe output.
+    // Shape is [1, embeddingDim] for sentence_embedding — we need the last dim.
     final probeOutput = probeOutputs.first as OrtValueTensor;
     final probeValue = probeOutput.value;
-    final probeList = probeValue as List;
-    final embeddingDim = probeList.first is List
-        ? (probeList.first as List).length
-        : probeList.length;
+    debugPrint('[DesktopEmbedding] Probe output type: ${probeValue.runtimeType}');
+
+    // Walk into nested lists to find the innermost dimension
+    int embeddingDim;
+    dynamic inner = probeValue;
+    while (inner is List && inner.isNotEmpty && inner.first is List) {
+      inner = inner.first;
+    }
+    embeddingDim = (inner is List) ? inner.length : 0;
 
     // Release probe tensors to free native memory
     probeInput.release();
@@ -337,18 +367,28 @@ class DesktopEmbeddingModel extends EmbeddingModel {
         [_outputName],
       );
 
-      // Extract the float embedding vector from the output tensor
+      // Extract the float embedding vector from the output tensor.
+      // The ONNX output is typically nested: [1, embeddingDim] comes back
+      // as List<List<num>>. We need to unwrap to a flat List<double>.
       final outputTensor = outputs.first as OrtValueTensor;
       final rawValue = outputTensor.value;
 
-      // Output shape is typically [1, embeddingDim] — extract the inner list
+      // Walk into nested lists until we reach the innermost vector.
+      // sentence_embedding shape [1, 768] → [[0.1, 0.2, ...]]
+      // We want the inner [0.1, 0.2, ...] as List<double>.
+      dynamic inner = rawValue;
+      while (inner is List && inner.isNotEmpty && inner.first is List) {
+        inner = inner.first;
+      }
+
+      // Convert from List<num> (which ONNX returns) to List<double>
       final List<double> embedding;
-      if (rawValue is List && rawValue.first is List) {
-        // Shape [1, N] — take the first (and only) row
-        embedding = (rawValue.first as List).cast<double>();
+      if (inner is List) {
+        embedding = inner.map<double>((e) => (e as num).toDouble()).toList();
       } else {
-        // Shape [N] — flat output
-        embedding = (rawValue as List).cast<double>();
+        throw StateError(
+          'Unexpected ONNX output shape: ${rawValue.runtimeType}',
+        );
       }
 
       // Release output tensors to free native memory
