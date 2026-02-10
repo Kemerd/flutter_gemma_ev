@@ -1,64 +1,93 @@
 part of 'flutter_gemma_desktop.dart';
 
 // =============================================================================
-// Desktop Embedding Model — TFLite + SentencePiece, Pure Dart
+// Desktop Embedding Model — ONNX Runtime + SentencePiece, Pure Dart
 // =============================================================================
-// Loads an EmbeddingGemma / Gecko .tflite model via tflite_flutter's FFI
-// Interpreter and runs inference entirely on the CPU (XNNPack-accelerated).
+// Loads an EmbeddingGemma ONNX model via the onnxruntime package's FFI
+// bindings and runs inference using ONNX Runtime's native C++ thread pool.
 //
 // The mobile platforms use MediaPipe's native TextEmbedder through Pigeon,
 // but that native API isn't available on desktop.  This class replicates the
 // same functionality using:
 //   1. SentencePieceTokenizer  — pure Dart protobuf parser + Viterbi encoder
-//   2. tflite_flutter           — Dart FFI bindings to the TFLite C library
+//   2. onnxruntime              — Dart FFI bindings to the ONNX Runtime C API
 //
-// Input/output tensor shapes are detected at runtime so this works with any
-// EmbeddingGemma or Gecko variant regardless of sequence length.
+// Key advantages over the previous TFLite implementation:
+//   - Multi-core parallel inference via ortParallel execution mode
+//   - Hardware acceleration via DirectML (Windows GPU), CUDA, CoreML, etc.
+//   - Non-blocking inference via runOnceAsync() (spawns isolates for FFI calls)
+//   - External data file support (.onnx + .onnx_data) for large quantized models
+//
+// The ONNX model uses two files: model_q4.onnx (graph, ~519KB) and
+// model_q4.onnx_data (weights, ~197MB). OrtSession.fromFile() automatically
+// resolves the companion data file from the same directory.
 // =============================================================================
 
 class DesktopEmbeddingModel extends EmbeddingModel {
   // -------------------------------------------------------------------------
   // Fields
   // -------------------------------------------------------------------------
-  final Interpreter _interpreter;
 
-  /// IsolateInterpreter runs TFLite inference in a background isolate,
-  /// preventing the main (UI) thread from blocking during the FFI call.
-  /// Without this, every _interpreter.run() freezes the UI for the
-  /// duration of model inference (~50-200ms per page on desktop CPU).
-  final IsolateInterpreter _isolateInterpreter;
+  /// The ONNX Runtime session — shared across all inference calls.
+  /// ONNX Runtime's C++ thread pool handles multi-core distribution internally,
+  /// so a single session can serve concurrent requests safely.
+  final OrtSession _session;
 
+  /// Session options — must be kept alive for the duration of the session.
+  final OrtSessionOptions _sessionOptions;
+
+  /// Run options — reusable across inference calls (stateless).
+  final OrtRunOptions _runOptions;
+
+  /// SentencePiece tokenizer — pure Dart, no native dependency.
   final SentencePieceTokenizer _tokenizer;
+
+  /// Maximum input sequence length (detected from model input shape).
   final int _maxSeqLength;
+
+  /// Output embedding dimensionality (detected from model output shape).
   final int _embeddingDim;
-  final int _inputCount;
+
+  /// Names of the model's input tensors (e.g. ['input_ids', 'attention_mask']).
+  final List<String> _inputNames;
+
+  /// Name of the model's output tensor (e.g. 'embeddings').
+  final String _outputName;
+
+  /// Callback invoked when the model is closed (clears plugin singleton refs).
   final VoidCallback onClose;
+
+  /// Guard against use-after-close.
   bool _isClosed = false;
 
   DesktopEmbeddingModel._({
-    required Interpreter interpreter,
-    required IsolateInterpreter isolateInterpreter,
+    required OrtSession session,
+    required OrtSessionOptions sessionOptions,
+    required OrtRunOptions runOptions,
     required SentencePieceTokenizer tokenizer,
     required int maxSeqLength,
     required int embeddingDim,
-    required int inputCount,
+    required List<String> inputNames,
+    required String outputName,
     required this.onClose,
-  })  : _interpreter = interpreter,
-        _isolateInterpreter = isolateInterpreter,
+  })  : _session = session,
+        _sessionOptions = sessionOptions,
+        _runOptions = runOptions,
         _tokenizer = tokenizer,
         _maxSeqLength = maxSeqLength,
         _embeddingDim = embeddingDim,
-        _inputCount = inputCount;
+        _inputNames = inputNames,
+        _outputName = outputName;
 
   // -------------------------------------------------------------------------
-  // Factory constructor — loads model + tokenizer, inspects tensor shapes
+  // Factory constructor — loads model + tokenizer, configures ONNX session
   // -------------------------------------------------------------------------
 
   /// Create a new desktop embedding model from file paths.
   ///
-  /// [modelPath]      — path to the .tflite embedding model file
+  /// [modelPath]      — path to the .onnx embedding model file
   /// [tokenizerPath]  — path to the sentencepiece.model tokenizer file
-  /// [preferredBackend] — CPU or GPU hint (only CPU/XNNPack on desktop)
+  /// [preferredBackend] — CPU or GPU hint (auto-detected via appendDefaultProviders)
   /// [onClose]        — callback when the model is closed
   static Future<DesktopEmbeddingModel> create({
     required String modelPath,
@@ -67,7 +96,7 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     required VoidCallback onClose,
   }) async {
     // -----------------------------------------------------------------
-    // Load the SentencePiece tokenizer
+    // Load the SentencePiece tokenizer (pure Dart, no FFI needed)
     // -----------------------------------------------------------------
     debugPrint('[DesktopEmbedding] Loading tokenizer from: $tokenizerPath');
     final tokenizer = await SentencePieceTokenizer.load(tokenizerPath);
@@ -75,24 +104,54 @@ class DesktopEmbeddingModel extends EmbeddingModel {
         '${tokenizer.vocabSize} pieces');
 
     // -----------------------------------------------------------------
-    // Configure TFLite interpreter options
+    // Initialize ONNX Runtime environment (singleton, safe to call multiple
+    // times — subsequent calls are no-ops if already initialized)
     // -----------------------------------------------------------------
-    final cpuCount = Platform.numberOfProcessors;
-    final options = InterpreterOptions()..threads = cpuCount;
-    debugPrint('[DesktopEmbedding] InterpreterOptions created '
-        '(threads: $cpuCount)');
-
-    // XNNPack is disabled for now — the delegate constructor crashes on
-    // Windows with certain TFLite C library builds.  Plain CPU with
-    // multi-threading still gives decent performance.
-    // TODO(desktop): Re-enable once a compatible TFLite build is confirmed.
-    const bool useXnnpack = false;
-    debugPrint('[DesktopEmbedding] Using plain CPU backend (XNNPack disabled)');
+    OrtEnv.instance.init();
+    debugPrint('[DesktopEmbedding] ONNX Runtime v${OrtEnv.version} initialized');
 
     // -----------------------------------------------------------------
-    // Load the TFLite model (with XNNPack fallback)
+    // Configure session options for maximum throughput
     // -----------------------------------------------------------------
-    debugPrint('[DesktopEmbedding] Loading model from: $modelPath');
+    final sessionOptions = OrtSessionOptions();
+
+    // Let ONNX Runtime use all available CPU cores for both inter-op
+    // (parallel operator execution) and intra-op (parallelism within
+    // individual operators like matrix multiplications).
+    // 0 = "let ONNX Runtime decide" (uses all cores).
+    sessionOptions.setInterOpNumThreads(0);
+    sessionOptions.setIntraOpNumThreads(0);
+
+    // Enable all graph optimizations (constant folding, node fusion, etc.)
+    sessionOptions.setSessionGraphOptimizationLevel(
+      GraphOptimizationLevel.ortEnableAll,
+    );
+
+    // Parallel execution mode — allows independent operators in the
+    // computation graph to run concurrently on the C++ thread pool.
+    sessionOptions.setSessionExecutionMode(
+      OrtSessionExecutionMode.ortParallel,
+    );
+
+    debugPrint('[DesktopEmbedding] Session options configured '
+        '(ortParallel, all optimizations, auto threads)');
+
+    // -----------------------------------------------------------------
+    // Append hardware acceleration providers (auto-detect best available)
+    // -----------------------------------------------------------------
+    // This tries DirectML (Windows GPU), CUDA (NVIDIA), CoreML (Apple),
+    // NNAPI (Android), etc. in priority order, with CPU as final fallback.
+    await sessionOptions.appendDefaultProviders();
+    debugPrint('[DesktopEmbedding] Execution providers appended '
+        '(auto-detected best available hardware)');
+
+    // -----------------------------------------------------------------
+    // Create the ONNX session from file
+    // -----------------------------------------------------------------
+    // IMPORTANT: We use fromFile() (not fromBuffer) because the ONNX model
+    // has external data (model_q4.onnx_data). fromFile() lets the runtime
+    // auto-resolve the companion .onnx_data file from the same directory.
+    debugPrint('[DesktopEmbedding] Loading ONNX model from: $modelPath');
     final modelFile = File(modelPath);
     if (!modelFile.existsSync()) {
       throw FileSystemException('Model file not found', modelPath);
@@ -100,77 +159,95 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     debugPrint('[DesktopEmbedding] Model file size: '
         '${modelFile.lengthSync()} bytes');
 
-    // Read model into memory first — avoids potential file-handle issues
-    // in the native C library on Windows
-    debugPrint('[DesktopEmbedding] Reading model into memory...');
-    final modelBytes = await modelFile.readAsBytes();
-    debugPrint('[DesktopEmbedding] Model bytes read: ${modelBytes.length}');
+    final session = OrtSession.fromFile(modelFile, sessionOptions);
+    debugPrint('[DesktopEmbedding] OrtSession created successfully');
 
-    late Interpreter interpreter;
-    try {
-      debugPrint('[DesktopEmbedding] Creating interpreter (XNNPack=$useXnnpack)...');
-      interpreter = Interpreter.fromBuffer(modelBytes, options: options);
-      debugPrint('[DesktopEmbedding] Interpreter created OK');
-    } catch (e) {
-      // If XNNPack was on and it crashed, retry without it
-      if (useXnnpack) {
-        debugPrint('[DesktopEmbedding] Interpreter failed with XNNPack, '
-            'retrying without delegate: $e');
-        final fallbackOptions = InterpreterOptions()..threads = cpuCount;
-        interpreter =
-            Interpreter.fromBuffer(modelBytes, options: fallbackOptions);
-        debugPrint('[DesktopEmbedding] Interpreter created OK (no delegate)');
-      } else {
-        rethrow;
-      }
+    // -----------------------------------------------------------------
+    // Inspect input/output tensor names and shapes
+    // -----------------------------------------------------------------
+    final inputNames = session.inputNames;
+    final outputNames = session.outputNames;
+
+    debugPrint('[DesktopEmbedding] Input tensors: $inputNames');
+    debugPrint('[DesktopEmbedding] Output tensors: $outputNames');
+
+    // Determine sequence length and embedding dimension by running a
+    // probe inference with a dummy input. ONNX models with dynamic axes
+    // don't expose shapes statically, so we infer them from actual output.
+    // We use a sequence length of 256 (EmbeddingGemma's standard) and
+    // detect the embedding dimension from the output shape.
+    const probeSeqLength = 256;
+    final outputName = outputNames.first;
+
+    // Run a quick probe to discover the embedding dimension
+    final probeTokens = Int64List(probeSeqLength);
+    probeTokens[0] = tokenizer.bosId; // BOS token, rest are zeros (padding)
+    final probeInput = OrtValueTensor.createTensorWithDataList(
+      probeTokens,
+      [1, probeSeqLength],
+    );
+
+    // Build probe inputs map — handle models with attention_mask input
+    final probeInputs = <String, OrtValue>{};
+    probeInputs[inputNames.first] = probeInput;
+
+    // If model expects attention_mask, provide it (1 for BOS, 0 for padding)
+    if (inputNames.length >= 2) {
+      final attentionMask = Int64List(probeSeqLength);
+      attentionMask[0] = 1; // Only BOS token is "real"
+      final maskTensor = OrtValueTensor.createTensorWithDataList(
+        attentionMask,
+        [1, probeSeqLength],
+      );
+      probeInputs[inputNames[1]] = maskTensor;
     }
 
-    debugPrint('[DesktopEmbedding] Allocating tensors...');
-    interpreter.allocateTensors();
-    debugPrint('[DesktopEmbedding] Tensors allocated');
+    // If model expects token_type_ids, provide all zeros
+    if (inputNames.length >= 3) {
+      final tokenTypeIds = Int64List(probeSeqLength);
+      final typeTensor = OrtValueTensor.createTensorWithDataList(
+        tokenTypeIds,
+        [1, probeSeqLength],
+      );
+      probeInputs[inputNames[2]] = typeTensor;
+    }
 
-    // -----------------------------------------------------------------
-    // Inspect tensor shapes so we work with any EmbeddingGemma variant
-    // -----------------------------------------------------------------
-    final inputCount = interpreter.getInputTensors().length;
-    final inputTensor = interpreter.getInputTensor(0);
-    final outputTensor = interpreter.getOutputTensor(0);
+    final runOptions = OrtRunOptions();
+    final probeOutputs = session.run(runOptions, probeInputs);
 
-    final inputShape = inputTensor.shape; // e.g. [1, 256]
-    final outputShape = outputTensor.shape; // e.g. [1, 768]
+    // Extract embedding dimension from the probe output
+    final probeOutput = probeOutputs.first as OrtValueTensor;
+    final probeValue = probeOutput.value;
+    final probeList = probeValue as List;
+    final embeddingDim = probeList.first is List
+        ? (probeList.first as List).length
+        : probeList.length;
 
-    final maxSeqLength = inputShape.length >= 2 ? inputShape[1] : inputShape[0];
-    final embeddingDim =
-        outputShape.length >= 2 ? outputShape[1] : outputShape[0];
+    // Release probe tensors to free native memory
+    probeInput.release();
+    for (final entry in probeInputs.values) {
+      if (entry != probeInput) entry.release();
+    }
+    for (final output in probeOutputs) {
+      output?.release();
+    }
 
-    debugPrint('[DesktopEmbedding] Input  shape: $inputShape '
-        '(${inputTensor.type})');
-    debugPrint('[DesktopEmbedding] Output shape: $outputShape '
-        '(${outputTensor.type})');
-    debugPrint('[DesktopEmbedding] Sequence length: $maxSeqLength, '
+    debugPrint('[DesktopEmbedding] Sequence length: $probeSeqLength, '
         'Embedding dim: $embeddingDim');
-    debugPrint('[DesktopEmbedding] Model has $inputCount input tensor(s)');
-
-    // ---------------------------------------------------------------
-    // Wrap the interpreter in an IsolateInterpreter so inference runs
-    // on a background isolate instead of blocking the UI thread.
-    // The address is the raw pointer to the underlying TFLite C struct.
-    // ---------------------------------------------------------------
-    debugPrint('[DesktopEmbedding] Creating IsolateInterpreter for '
-        'non-blocking inference...');
-    final isolateInterpreter = await IsolateInterpreter.create(
-      address: interpreter.address,
-    );
-    debugPrint('[DesktopEmbedding] IsolateInterpreter ready — '
-        'inference will NOT block the UI thread');
+    debugPrint('[DesktopEmbedding] Model has ${inputNames.length} '
+        'input tensor(s)');
+    debugPrint('[DesktopEmbedding] Ready — inference will NOT block '
+        'the UI thread (runOnceAsync)');
 
     return DesktopEmbeddingModel._(
-      interpreter: interpreter,
-      isolateInterpreter: isolateInterpreter,
+      session: session,
+      sessionOptions: sessionOptions,
+      runOptions: runOptions,
       tokenizer: tokenizer,
-      maxSeqLength: maxSeqLength,
+      maxSeqLength: probeSeqLength,
       embeddingDim: embeddingDim,
-      inputCount: inputCount,
+      inputNames: inputNames,
+      outputName: outputName,
       onClose: onClose,
     );
   }
@@ -187,6 +264,59 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   }
 
   // -------------------------------------------------------------------------
+  // Build input tensors for a given text
+  // -------------------------------------------------------------------------
+
+  /// Tokenizes [text] and creates the ORT input tensor map.
+  /// Returns both the map and a list of all created tensors for cleanup.
+  ({Map<String, OrtValue> inputs, List<OrtValue> tensors}) _buildInputs(
+    String text,
+  ) {
+    // Tokenize the input text to fixed-length token IDs
+    final tokenIds = _tokenizer.encode(text, maxLength: _maxSeqLength);
+    final int64TokenIds = Int64List.fromList(tokenIds);
+
+    // Create the primary input tensor (token IDs)
+    final inputIdsTensor = OrtValueTensor.createTensorWithDataList(
+      int64TokenIds,
+      [1, _maxSeqLength],
+    );
+
+    final inputs = <String, OrtValue>{};
+    final tensors = <OrtValue>[inputIdsTensor];
+
+    // First input is always token IDs
+    inputs[_inputNames.first] = inputIdsTensor;
+
+    // Second input: attention mask (1 for real tokens, 0 for padding)
+    if (_inputNames.length >= 2) {
+      final attentionMask = Int64List(_maxSeqLength);
+      for (int i = 0; i < _maxSeqLength; i++) {
+        attentionMask[i] = tokenIds[i] != _tokenizer.padId ? 1 : 0;
+      }
+      final maskTensor = OrtValueTensor.createTensorWithDataList(
+        attentionMask,
+        [1, _maxSeqLength],
+      );
+      inputs[_inputNames[1]] = maskTensor;
+      tensors.add(maskTensor);
+    }
+
+    // Third input: token type IDs (all zeros for single-segment models)
+    if (_inputNames.length >= 3) {
+      final tokenTypeIds = Int64List(_maxSeqLength);
+      final typeTensor = OrtValueTensor.createTensorWithDataList(
+        tokenTypeIds,
+        [1, _maxSeqLength],
+      );
+      inputs[_inputNames[2]] = typeTensor;
+      tensors.add(typeTensor);
+    }
+
+    return (inputs: inputs, tensors: tensors);
+  }
+
+  // -------------------------------------------------------------------------
   // EmbeddingModel interface implementation
   // -------------------------------------------------------------------------
 
@@ -194,45 +324,44 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   Future<List<double>> generateEmbedding(String text) async {
     _assertNotClosed();
 
-    // Tokenize the input text to fixed-length token IDs
-    final tokenIds = _tokenizer.encode(text, maxLength: _maxSeqLength);
+    // Build input tensors from tokenized text
+    final (:inputs, :tensors) = _buildInputs(text);
 
-    // Build the input tensor(s).
-    // Most EmbeddingGemma models have 1 input (token_ids).
-    // Some have 2 (token_ids + attention_mask) or 3 (+ token_type_ids).
-    final inputIds = [tokenIds]; // shape [1, seq_len]
+    try {
+      // Run inference on a background isolate via runOnceAsync().
+      // This spawns a fresh Dart isolate that calls into the shared native
+      // ONNX Runtime session via FFI, keeping the UI thread completely free.
+      final outputs = await _session.runOnceAsync(
+        _runOptions,
+        inputs,
+        [_outputName],
+      );
 
-    if (_inputCount == 1) {
-      // Single input: just token IDs
-      // Uses IsolateInterpreter so inference runs on a background isolate,
-      // keeping the UI thread completely free to render frames.
-      final output = [List<double>.filled(_embeddingDim, 0.0)];
-      await _isolateInterpreter.run(inputIds, output);
-      return output[0];
-    } else {
-      // Multiple inputs: token_ids + attention_mask (+ token_type_ids)
-      // Attention mask: 1 for real tokens, 0 for padding
-      final attentionMask = [
-        tokenIds
-            .map((id) => id != _tokenizer.padId ? 1 : 0)
-            .toList(),
-      ];
+      // Extract the float embedding vector from the output tensor
+      final outputTensor = outputs.first as OrtValueTensor;
+      final rawValue = outputTensor.value;
 
-      final inputs = <Object>[inputIds, attentionMask];
-
-      // Third input (token_type_ids) if the model expects it — all zeros
-      if (_inputCount >= 3) {
-        inputs.add([List<int>.filled(_maxSeqLength, 0)]);
+      // Output shape is typically [1, embeddingDim] — extract the inner list
+      final List<double> embedding;
+      if (rawValue is List && rawValue.first is List) {
+        // Shape [1, N] — take the first (and only) row
+        embedding = (rawValue.first as List).cast<double>();
+      } else {
+        // Shape [N] — flat output
+        embedding = (rawValue as List).cast<double>();
       }
 
-      // Run with multiple inputs via IsolateInterpreter (non-blocking).
-      // The actual TFLite FFI call happens on a background isolate.
-      final outputs = <int, Object>{
-        0: [List<double>.filled(_embeddingDim, 0.0)],
-      };
-      await _isolateInterpreter.runForMultipleInputs(inputs, outputs);
+      // Release output tensors to free native memory
+      for (final output in outputs) {
+        output?.release();
+      }
 
-      return (outputs[0]! as List<List<double>>)[0];
+      return embedding;
+    } finally {
+      // Always release input tensors regardless of success/failure
+      for (final tensor in tensors) {
+        tensor.release();
+      }
     }
   }
 
@@ -240,13 +369,13 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   Future<List<List<double>>> generateEmbeddings(List<String> texts) async {
     _assertNotClosed();
 
-    // Process texts one by one (batch inference is possible but adds
-    // complexity with tensor reshaping — fine for desktop perf)
-    final results = <List<double>>[];
-    for (final text in texts) {
-      results.add(await generateEmbedding(text));
-    }
-    return results;
+    // Fire all inference requests concurrently via Future.wait().
+    // Each runOnceAsync() call spawns its own isolate, allowing true parallel
+    // inference — ONNX Runtime's C++ thread pool handles the native-level
+    // concurrency. This is the same ortParallel pattern used in nihon_dojo's
+    // SharedSessionManager.runBatchInference().
+    final futures = texts.map((text) => generateEmbedding(text));
+    return Future.wait(futures);
   }
 
   @override
@@ -260,12 +389,17 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     if (_isClosed) return;
     _isClosed = true;
 
-    // Close the isolate interpreter first (stops the background isolate),
-    // then close the underlying interpreter (frees native TFLite resources).
-    await _isolateInterpreter.close();
-    _interpreter.close();
+    // Release ONNX Runtime resources in dependency order:
+    // 1. Kill all isolates (stops background inference workers)
+    // 2. Release the session (frees native model memory)
+    // 3. Release options objects (frees native config memory)
+    await _session.release();
+    _sessionOptions.release();
+    _runOptions.release();
+
+    // Notify the plugin singleton that this model is gone
     onClose();
 
-    debugPrint('[DesktopEmbedding] Model closed');
+    debugPrint('[DesktopEmbedding] Model closed — all native resources freed');
   }
 }

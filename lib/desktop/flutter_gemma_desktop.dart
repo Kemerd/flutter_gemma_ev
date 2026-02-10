@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:onnxruntime/onnxruntime.dart';
 
 import '../flutter_gemma_interface.dart';
 import '../model_file_manager_interface.dart';
@@ -58,7 +58,7 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
   InferenceModel? _initializedModel;
   InferenceModelSpec? _lastActiveInferenceSpec;
 
-  // Embedding model — loaded via tflite_flutter (desktop-specific)
+  // Embedding model — loaded via ONNX Runtime (desktop-specific)
   EmbeddingModel? _initializedEmbeddingModel;
   Completer<EmbeddingModel>? _initEmbeddingCompleter;
   EmbeddingModelSpec? _lastActiveEmbeddingSpec;
@@ -334,7 +334,7 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
 
     try {
       // -----------------------------------------------------------------
-      // Create DesktopEmbeddingModel (tflite_flutter + SentencePiece)
+      // Create DesktopEmbeddingModel (ONNX Runtime + SentencePiece)
       // -----------------------------------------------------------------
       final model =
           _initializedEmbeddingModel = await DesktopEmbeddingModel.create(

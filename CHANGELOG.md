@@ -1,3 +1,6 @@
+## 0.13.6
+- **Desktop Embedding**: ONNX Runtime replaces TFLite
+
 ## 0.13.0
 - **Native FFI Desktop**: Replace gRPC/Java with direct C API via Dart FFI
 - **Zero Java**: Remove litertlm-server, JRE, JAR — pure native on desktop

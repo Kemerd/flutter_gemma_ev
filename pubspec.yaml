@@ -29,8 +29,9 @@ dependencies:
   background_downloader: ^9.2.3
   # Desktop native FFI support (LiteRT-LM C API)
   ffi: ^2.1.0
-  # Desktop embedding support (TFLite interpreter via FFI)
-  tflite_flutter: ^0.12.1
+  # Desktop embedding support (ONNX Runtime via FFI)
+  onnxruntime:
+    path: L:\Dev\onnxruntime_flutter_1_22_0
 
 dev_dependencies:
   flutter_test:

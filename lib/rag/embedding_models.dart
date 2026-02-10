@@ -61,6 +61,20 @@ enum EmbeddingModel {
     size: '110MB',
     dimension: 768,
     needsAuth: true,
+  ),
+
+  // ONNX Runtime Q4 quantized variant for desktop (external data model)
+  // Two files: model_q4.onnx (graph, ~519KB) + model_q4.onnx_data (weights, ~197MB)
+  embeddingGemma300MQ4Onnx(
+    url: 'https://huggingface.co/google/embeddinggemma-300m-4bit/resolve/main/model_q4.onnx',
+    tokenizerUrl:
+        'https://huggingface.co/google/embeddinggemma-300m-4bit/resolve/main/sentencepiece.model',
+    filename: 'model_q4.onnx',
+    tokenizerFilename: 'sentencepiece.model',
+    displayName: 'EmbeddingGemma 300M Q4 (ONNX)',
+    size: '197MB',
+    dimension: 768,
+    needsAuth: true,
   );
 
   /// Enum fields
