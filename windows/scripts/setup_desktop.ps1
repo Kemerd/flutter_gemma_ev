@@ -33,8 +33,10 @@ Write-Host "=== LiteRT-LM Native Desktop Setup (Windows) ===" -ForegroundColor C
 # Configuration
 # ============================================================================
 
-# GitHub base URL for raw LFS file downloads
-$GitHubBaseUrl = "https://github.com/google-ai-edge/LiteRT-LM/raw/main/prebuilt"
+# GitHub base URL for prebuilt C API + accelerator DLLs.
+# These are built from LiteRT-LM source with the custom C API wrapper.
+# See: https://github.com/Kemerd/LiteRT-LM-FFI
+$GitHubBaseUrl = "https://github.com/Kemerd/LiteRT-LM-FFI/raw/master/prebuilt"
 
 # Architecture detection
 $Arch = $env:PROCESSOR_ARCHITECTURE
