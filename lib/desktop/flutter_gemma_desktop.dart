@@ -146,10 +146,14 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
       // Create native FFI client and initialize engine directly
       final nativeClient = LiteRtLmNativeClient();
 
+      // Determine which backend to attempt first
+      final requestedBackend =
+          preferredBackend == PreferredBackend.cpu ? 'cpu' : 'gpu';
+
       try {
         await nativeClient.initialize(
           modelPath: modelPath,
-          backend: preferredBackend == PreferredBackend.cpu ? 'cpu' : 'gpu',
+          backend: requestedBackend,
           maxTokens: maxTokens,
           enableVision: supportImage,
           maxNumImages: supportImage ? (maxNumImages ?? 1) : 0,
@@ -163,7 +167,44 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
             errorMsg.contains('not found')) {
           throw Exception('Model file not found or inaccessible: $modelPath');
         }
-        rethrow;
+
+        // If GPU was requested and failed, fall back to CPU automatically.
+        // GPU/WebGPU can crash or throw on some driver/hardware combos,
+        // so gracefully degrading to CPU keeps the app usable.
+        if (requestedBackend == 'gpu') {
+          debugPrint(
+            '[FlutterGemmaDesktop] GPU backend failed ($e), '
+            'falling back to CPU...',
+          );
+
+          // Shut down the partially-initialized client before retrying
+          try {
+            await nativeClient.shutdown();
+          } catch (_) {
+            // Ignore shutdown errors on a failed init
+          }
+
+          try {
+            await nativeClient.initialize(
+              modelPath: modelPath,
+              backend: 'cpu',
+              maxTokens: maxTokens,
+              enableVision: supportImage,
+              maxNumImages: supportImage ? (maxNumImages ?? 1) : 0,
+              enableAudio: supportAudio,
+            );
+            debugPrint('[FlutterGemmaDesktop] CPU fallback succeeded');
+          } catch (cpuError) {
+            // Both backends failed — throw the CPU error (more actionable)
+            throw Exception(
+              'Both GPU and CPU backends failed.\n'
+              'GPU error: $e\n'
+              'CPU error: $cpuError',
+            );
+          }
+        } else {
+          rethrow;
+        }
       }
 
       // Create model instance

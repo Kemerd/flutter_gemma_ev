@@ -178,6 +178,17 @@ typedef EngineSettingsSetCacheDir = void Function(
   Pointer<Utf8> cacheDir,
 );
 
+/// Sets the directory containing LiteRT accelerator DLLs so the GPU/WebGPU
+/// backend can find libLiteRtWebGpuAccelerator.dll and friends at runtime.
+typedef _EngineSettingsSetDispatchLibDirNative = Void Function(
+  Pointer<LiteRtLmEngineSettings> settings,
+  Pointer<Utf8> dir,
+);
+typedef EngineSettingsSetDispatchLibDir = void Function(
+  Pointer<LiteRtLmEngineSettings> settings,
+  Pointer<Utf8> dir,
+);
+
 typedef _EngineSettingsSetActivationDataTypeNative = Void Function(
   Pointer<LiteRtLmEngineSettings> settings,
   Int32 activationDataTypeInt,
@@ -451,6 +462,7 @@ class LiteRtLmBindings {
   late final EngineSettingsDelete engineSettingsDelete;
   late final EngineSettingsSetMaxNumTokens engineSettingsSetMaxNumTokens;
   late final EngineSettingsSetCacheDir engineSettingsSetCacheDir;
+  EngineSettingsSetDispatchLibDir? engineSettingsSetDispatchLibDir;
   late final EngineSettingsSetActivationDataType
       engineSettingsSetActivationDataType;
   late final EngineSettingsEnableBenchmark engineSettingsEnableBenchmark;
@@ -532,6 +544,19 @@ class LiteRtLmBindings {
         _EngineSettingsSetCacheDirNative, EngineSettingsSetCacheDir>(
       'litert_lm_engine_settings_set_cache_dir',
     );
+
+    // Optional — only present in our patched build (not upstream LiteRT-LM).
+    // Tells the runtime where accelerator DLLs live for GPU/WebGPU.
+    try {
+      engineSettingsSetDispatchLibDir = _lib.lookupFunction<
+          _EngineSettingsSetDispatchLibDirNative,
+          EngineSettingsSetDispatchLibDir>(
+        'litert_lm_engine_settings_set_dispatch_lib_dir',
+      );
+    } catch (_) {
+      engineSettingsSetDispatchLibDir = null;
+    }
+
     engineSettingsSetActivationDataType = _lib.lookupFunction<
         _EngineSettingsSetActivationDataTypeNative,
         EngineSettingsSetActivationDataType>(

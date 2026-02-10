@@ -205,6 +205,11 @@ class LiteRtLmNativeClient {
 
     // Run the heavy engine creation on an isolate to avoid blocking the UI.
     // Pointer can't be sent across isolates, so we pass the raw address as int.
+    // Resolve the dispatch library directory — this is where the accelerator
+    // DLLs live (libLiteRtWebGpuAccelerator.dll, etc.). Without this, the
+    // GPU/WebGPU backend can't find its runtime dependencies and crashes.
+    final dispatchLibDir = path.dirname(libraryPath);
+
     final engineAddress = await compute(_createEngineIsolate, _EngineCreateParams(
       libraryPath: libraryPath,
       modelPath: modelPath,
@@ -212,6 +217,7 @@ class LiteRtLmNativeClient {
       enableVision: enableVision,
       enableAudio: enableAudio,
       maxTokens: maxTokens,
+      dispatchLibDir: dispatchLibDir,
     ));
 
     if (engineAddress == 0) {
@@ -584,6 +590,11 @@ class _EngineCreateParams {
   final bool enableAudio;
   final int maxTokens;
 
+  /// Directory containing LiteRT accelerator DLLs (e.g. litertlm/).
+  /// If set, tells the runtime where to find libLiteRtWebGpuAccelerator.dll
+  /// and other GPU dispatch libraries.
+  final String? dispatchLibDir;
+
   _EngineCreateParams({
     required this.libraryPath,
     required this.modelPath,
@@ -591,6 +602,7 @@ class _EngineCreateParams {
     required this.enableVision,
     required this.enableAudio,
     required this.maxTokens,
+    this.dispatchLibDir,
   });
 }
 
@@ -611,9 +623,12 @@ int _createEngineIsolate(_EngineCreateParams params) {
   final modelPathPtr = params.modelPath.toNativeUtf8();
   final backendPtr = params.backend.toNativeUtf8();
 
-  // Vision and audio backends: pass nullptr if not enabled
+  // Vision and audio backends: pass nullptr if not enabled.
+  // Vision always uses GPU — most .litertlm models constrain the vision
+  // encoder to GPU only, so we hardcode 'gpu' here regardless of the main
+  // backend. The main LLM prefill/decode can run on CPU just fine.
   final visionBackendPtr = params.enableVision
-      ? params.backend.toNativeUtf8()
+      ? 'gpu'.toNativeUtf8()
       : nullptr;
   final audioBackendPtr = params.enableAudio
       ? 'cpu'.toNativeUtf8() // Audio always runs on CPU
@@ -634,6 +649,15 @@ int _createEngineIsolate(_EngineCreateParams params) {
 
     // Set max tokens
     bindings.engineSettingsSetMaxNumTokens(settings, params.maxTokens);
+
+    // Tell the runtime where accelerator DLLs live so GPU/WebGPU can find
+    // libLiteRtWebGpuAccelerator.dll and friends at init time.
+    if (params.dispatchLibDir != null &&
+        bindings.engineSettingsSetDispatchLibDir != null) {
+      final dirPtr = params.dispatchLibDir!.toNativeUtf8();
+      bindings.engineSettingsSetDispatchLibDir!(settings, dirPtr.cast<Utf8>());
+      calloc.free(dirPtr);
+    }
 
     // Create the engine (this is the heavy part — loads model, compiles shaders)
     final engine = bindings.engineCreate(settings);
