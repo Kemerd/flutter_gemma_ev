@@ -53,6 +53,40 @@ class LiteRtLmNativeClient {
   bool get hasConversation => _conversation != null;
 
   // ==========================================================================
+  // Windows DLL search path — ensure dependencies in litertlm/ are findable
+  // ==========================================================================
+
+  /// Adds [directory] to the Windows DLL search path via SetDllDirectoryW.
+  ///
+  /// When litert_lm_capi.dll is loaded from a litertlm/ subfolder, Windows
+  /// won't automatically search that folder for dependent DLLs like
+  /// libGemmaModelConstraintProvider.dll. This call tells the loader to
+  /// include that directory when resolving implicit dependencies.
+  static void _addDllDirectory(String directory) {
+    try {
+      final kernel32 = DynamicLibrary.open('kernel32.dll');
+
+      // BOOL SetDllDirectoryW(LPCWSTR lpPathName)
+      final setDllDirectory = kernel32.lookupFunction<
+          Int32 Function(Pointer<Utf16> lpPathName),
+          int Function(Pointer<Utf16> lpPathName)>('SetDllDirectoryW');
+
+      final dirPtr = directory.toNativeUtf16(allocator: calloc);
+      final result = setDllDirectory(dirPtr);
+      calloc.free(dirPtr);
+
+      if (result != 0) {
+        debugPrint('[LiteRtLmNative] Added DLL search path: $directory');
+      } else {
+        debugPrint('[LiteRtLmNative] WARNING: SetDllDirectoryW failed');
+      }
+    } catch (e) {
+      // Non-fatal — the DLL may still load if deps are on PATH
+      debugPrint('[LiteRtLmNative] Could not set DLL directory: $e');
+    }
+  }
+
+  // ==========================================================================
   // Library Loading — finds the right .dll/.so/.dylib for the current platform
   // ==========================================================================
 
@@ -145,6 +179,16 @@ class LiteRtLmNativeClient {
     // Load the native shared library
     final libraryPath = _resolveLibraryPath();
     debugPrint('[LiteRtLmNative] Loading library: $libraryPath');
+
+    // On Windows, the DLL lives in a litertlm/ subfolder alongside its
+    // dependencies (accelerator DLLs, DXC, etc.). Windows only searches
+    // the application directory for dependent DLLs, not the loaded DLL's
+    // own directory. We temporarily add the DLL's directory to the DLL
+    // search path so Windows can find libGemmaModelConstraintProvider.dll
+    // and friends when loading litert_lm_capi.dll.
+    if (Platform.isWindows) {
+      _addDllDirectory(path.dirname(libraryPath));
+    }
 
     try {
       _bindings = LiteRtLmBindings.open(libraryPath);
