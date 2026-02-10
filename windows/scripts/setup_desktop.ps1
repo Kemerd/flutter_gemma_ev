@@ -5,7 +5,7 @@
 .DESCRIPTION
     Downloads prebuilt LiteRT-LM accelerator libraries from GitHub and
     DirectX Shader Compiler for Windows GPU support.
-    No Java, no JRE, no JAR — pure native.
+    No Java, no JRE, no JAR - pure native.
 
 .PARAMETER PluginDir
     Path to the plugin directory (flutter_gemma/windows)
@@ -54,8 +54,8 @@ Write-Host "Output dir: $OutputDir"
 $PluginRoot = Split-Path -Parent $PluginDir
 
 # Libraries we need for Windows:
-#   - litert_lm_capi.dll  — the main C API library (built from source via native/build_litert_lm_dll.ps1)
-#   - Accelerator DLLs    — from LiteRT-LM/prebuilt/windows_x86_64/
+#   - litert_lm_capi.dll  - the main C API library (built from source via native/build_litert_lm_dll.ps1)
+#   - Accelerator DLLs    - from LiteRT-LM/prebuilt/windows_x86_64/
 $PrebuiltLibs = @(
     "litert_lm_capi.dll",
     "libGemmaModelConstraintProvider.dll",
@@ -114,7 +114,7 @@ function Download-IfNotCached {
     }
 
     # Download from GitHub (raw URL handles LFS redirect)
-    # Note: litert_lm_capi.dll is NOT on GitHub — it must be built locally
+    # Note: litert_lm_capi.dll is NOT on GitHub - it must be built locally
     $url = "$GitHubBaseUrl/$NativeArch/$FileName"
     Write-Host "  [download] $FileName from GitHub..." -ForegroundColor Cyan
     try {
@@ -123,9 +123,9 @@ function Download-IfNotCached {
         Copy-Item -Path $cachedFile -Destination $destFile -Force
         Write-Host "  [ok]     $FileName" -ForegroundColor Green
     } catch {
-        # Not fatal for the main CAPI library — it must be built from source
+        # Not fatal for the main CAPI library - it must be built from source
         if ($FileName -eq "litert_lm_capi.dll") {
-            Write-Host "  [MISSING] $FileName — run native\build_litert_lm_dll.ps1 to build from source" -ForegroundColor Red
+            Write-Host "  [MISSING] $FileName - run native\build_litert_lm_dll.ps1 to build from source" -ForegroundColor Red
         } else {
             Write-Warning "  Failed to download $FileName : $_"
             Write-Host "  URL: $url" -ForegroundColor Gray
@@ -219,9 +219,11 @@ try {
     # List what we have
     Write-Host "Bundled libraries:" -ForegroundColor Gray
     Get-ChildItem -Path $NativesDir -Filter "*.dll" | ForEach-Object {
-        Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1MB, 1)) MB)" -ForegroundColor Gray
+        $sizeStr = [string]([math]::Round($_.Length / 1048576, 1)) + " megabytes"
+        Write-Host "  $($_.Name) $sizeStr" -ForegroundColor Gray
     }
 } catch {
-    Write-Host "SETUP FAILED: $_" -ForegroundColor Red
+    $errMsg = $_.Exception.Message
+    Write-Host "SETUP FAILED: $errMsg" -ForegroundColor Red
     exit 1
 }
