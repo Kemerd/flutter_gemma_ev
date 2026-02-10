@@ -443,8 +443,8 @@ class LiteRtLmBindings {
 
   // ======================== Resolved function pointers ========================
 
-  // --- Logging ---
-  late final SetMinLogLevel setMinLogLevel;
+  // --- Logging (optional — not exported on all builds) ---
+  SetMinLogLevel? setMinLogLevel;
 
   // --- Engine Settings ---
   late final EngineSettingsCreate engineSettingsCreate;
@@ -504,10 +504,16 @@ class LiteRtLmBindings {
   /// Resolve every exported symbol from the loaded shared library.
   /// Called once during construction.
   void _resolveAll() {
-    // --- Logging ---
-    setMinLogLevel = _lib.lookupFunction<_SetMinLogLevelNative, SetMinLogLevel>(
-      'litert_lm_set_min_log_level',
-    );
+    // --- Logging (optional — not all LiteRT-LM builds export this) ---
+    try {
+      setMinLogLevel =
+          _lib.lookupFunction<_SetMinLogLevelNative, SetMinLogLevel>(
+        'litert_lm_set_min_log_level',
+      );
+    } catch (_) {
+      // Symbol not available in this build — logging stays at default level
+      setMinLogLevel = null;
+    }
 
     // --- Engine Settings ---
     engineSettingsCreate =

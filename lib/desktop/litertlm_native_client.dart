@@ -200,8 +200,8 @@ class LiteRtLmNativeClient {
       );
     }
 
-    // Set log level to WARNING to reduce noise
-    _bindings!.setMinLogLevel(1);
+    // Set log level to WARNING to reduce noise (optional symbol — may not exist)
+    _bindings!.setMinLogLevel?.call(1);
 
     // Run the heavy engine creation on an isolate to avoid blocking the UI.
     // Pointer can't be sent across isolates, so we pass the raw address as int.
@@ -604,8 +604,8 @@ int _createEngineIsolate(_EngineCreateParams params) {
   // Load the library in this isolate
   final bindings = LiteRtLmBindings.open(params.libraryPath);
 
-  // Suppress info-level logs during initialization
-  bindings.setMinLogLevel(1);
+  // Suppress info-level logs during initialization (optional symbol)
+  bindings.setMinLogLevel?.call(1);
 
   // Convert Dart strings to native UTF-8 strings for the C API
   final modelPathPtr = params.modelPath.toNativeUtf8();
