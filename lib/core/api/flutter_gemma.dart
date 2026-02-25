@@ -108,7 +108,24 @@ class FlutterGemma {
     WebStorageMode webStorageMode = WebStorageMode.cacheApi,
     @Deprecated('Use webStorageMode instead. Will be removed in v0.13.0')
     bool? enableWebCache,
+    /// Optional absolute path to a custom directory for model file storage.
+    ///
+    /// When set, downloaded model files are placed here instead of the
+    /// platform's default application documents directory. Particularly
+    /// useful on macOS machines with small internal drives — point this
+    /// to an external or secondary volume to avoid "No space left on
+    /// device" errors during the background-downloader → final-copy step.
+    ///
+    /// The directory is created automatically if it does not exist.
+    /// Pass `null` (default) to use platform defaults.
+    String? modelStorageDirectory,
   }) async {
+    // Configure custom model storage directory before anything else so
+    // that subsequent path lookups already resolve to the right location.
+    if (modelStorageDirectory != null) {
+      ModelFileSystemManager.setModelStorageDirectory(modelStorageDirectory);
+    }
+
     // Migration: enableWebCache takes precedence if provided (for backward compatibility)
     final effectiveStorageMode = enableWebCache != null
         ? (enableWebCache ? WebStorageMode.cacheApi : WebStorageMode.none)
@@ -119,6 +136,17 @@ class FlutterGemma {
       maxDownloadRetries: maxDownloadRetries,
       webStorageMode: effectiveStorageMode,
     );
+  }
+
+  /// Returns the resolved absolute path where a model file with [filename]
+  /// would be stored.
+  ///
+  /// Respects the [modelStorageDirectory] override set during [initialize].
+  /// Consumers that need to locate model files on disk (e.g. for rebinding
+  /// an embedding graph after download) should use this instead of
+  /// hard-coding `getApplicationDocumentsDirectory()`.
+  static Future<String> getModelFilePath(String filename) {
+    return ModelFileSystemManager.getModelFilePath(filename);
   }
 
   /// Start building an inference model installation

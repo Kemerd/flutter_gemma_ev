@@ -4,6 +4,12 @@ part of '../../../mobile/flutter_gemma_mobile.dart';
 ///
 /// This class delegates filename utilities to FileNameUtils for platform-agnostic
 /// string operations, and provides mobile-specific file system operations.
+///
+/// Supports an optional custom model storage directory. When set via
+/// [setModelStorageDirectory], all model files are stored there instead of
+/// the platform's default application documents directory. This is useful on
+/// machines with limited internal storage (e.g. 128 GB Mac Mini) where large
+/// model files should live on an external/secondary drive.
 class ModelFileSystemManager {
   /// Supported model file extensions (delegates to FileNameUtils)
   static const List<String> supportedExtensions = FileNameUtils.supportedExtensions;
@@ -12,6 +18,52 @@ class ModelFileSystemManager {
   static const List<String> smallFileExtensions = ['.json', '.model'];
 
   static const int _defaultMinSizeBytes = 1024 * 1024; // 1MB
+
+  // ---------------------------------------------------------------------------
+  // Custom Model Storage Directory
+  // ---------------------------------------------------------------------------
+  // When non-null, model files are stored here instead of the platform default
+  // (getApplicationDocumentsDirectory). This avoids the double-storage problem
+  // where background_downloader caches to the app container AND then copies to
+  // Documents — both on the same constrained internal drive. By pointing the
+  // final destination to an external volume, only the temporary cache sits on
+  // the internal drive during download.
+  // ---------------------------------------------------------------------------
+
+  static String? _customModelStorageDir;
+
+  /// Override the default model storage directory.
+  ///
+  /// When set, [getModelFilePath], [getOrphanedFiles], [getStorageInfo], and
+  /// related methods will use this directory instead of the platform's
+  /// application documents directory.
+  ///
+  /// Pass `null` to revert to the default behaviour.
+  ///
+  /// The directory is created automatically if it does not exist.
+  static void setModelStorageDirectory(String? directory) {
+    _customModelStorageDir = directory;
+    debugPrint('ModelFileSystemManager: model storage dir → '
+        '${directory ?? "(platform default)"}');
+  }
+
+  /// The current custom model storage directory, or `null` if using defaults.
+  static String? get customModelStorageDir => _customModelStorageDir;
+
+  /// Resolves the base directory for model file storage.
+  ///
+  /// Returns the custom directory if one has been configured, otherwise falls
+  /// back to [getApplicationDocumentsDirectory].
+  static Future<Directory> _resolveModelDirectory() async {
+    if (_customModelStorageDir != null) {
+      final dir = Directory(_customModelStorageDir!);
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+      return dir;
+    }
+    return await getApplicationDocumentsDirectory();
+  }
 
   /// Removes all supported extensions from filename (delegates to FileNameUtils)
   ///
@@ -76,9 +128,12 @@ class ModelFileSystemManager {
     }
   }
 
-  /// Gets the full file path for a model file with Android path correction
+  /// Gets the full file path for a model file.
+  ///
+  /// Respects [_customModelStorageDir] when set, otherwise uses the platform's
+  /// application documents directory with Android path correction applied.
   static Future<String> getModelFilePath(String filename) async {
-    final directory = await getApplicationDocumentsDirectory();
+    final directory = await _resolveModelDirectory();
     return getCorrectedPath(directory.path, filename);
   }
 
@@ -90,7 +145,7 @@ class ModelFileSystemManager {
     List<String>? protectedFiles,
     List<String>? supportedExtensions,
   }) async {
-    final directory = await getApplicationDocumentsDirectory();
+    final directory = await _resolveModelDirectory();
     final extensions = supportedExtensions ?? ModelFileSystemManager.supportedExtensions;
     final protected = protectedFiles ?? [];
 
@@ -132,7 +187,7 @@ class ModelFileSystemManager {
   static Future<StorageStats> getStorageInfo({
     List<String>? protectedFiles,
   }) async {
-    final directory = await getApplicationDocumentsDirectory();
+    final directory = await _resolveModelDirectory();
 
     final files = directory
         .listSync()
