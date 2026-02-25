@@ -31,7 +31,8 @@ dependencies:
   ffi: ^2.1.0
   # Desktop embedding support (ONNX Runtime via FFI)
   onnxruntime:
-    path: L:\Dev\onnxruntime_flutter_1_22_0
+    git:
+      url: https://github.com/Kemerd/onnxruntime_flutter_1_22_0.git
 
 dev_dependencies:
   flutter_test:
