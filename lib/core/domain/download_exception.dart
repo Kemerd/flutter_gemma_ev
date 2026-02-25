@@ -16,11 +16,9 @@ extension DownloadErrorMessage on DownloadError {
   String toUserMessage() {
     return switch (this) {
       UnauthorizedError() => 'Authentication required (HTTP 401).\n'
-          'Please provide a valid HuggingFace token using:\n'
-          'FlutterGemma.initialize(huggingFaceToken: "hf_...")',
+          'The download server rejected the request. Check your API key or token.',
       ForbiddenError() => 'Access forbidden (HTTP 403).\n'
-          'Your HuggingFace token is either invalid or does not have access to this model.\n'
-          'For gated models, visit the model page on HuggingFace and request access.',
+          'The download server denied access. Your API key/token may be invalid or restricted.',
       NotFoundError() => 'Model not found (HTTP 404).\n'
           'Please check the URL and ensure the model exists.\n'
           'Use /resolve/main/ format, not /blob/main/',

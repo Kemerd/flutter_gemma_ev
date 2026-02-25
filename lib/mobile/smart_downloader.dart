@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:background_downloader/background_downloader.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:flutter_gemma/core/domain/download_error.dart';
 import 'package:flutter_gemma/core/domain/download_exception.dart';
 import 'package:flutter_gemma/core/model_management/cancel_token.dart';
@@ -34,6 +36,41 @@ class SmartDownloader {
   static Future<void> _ensureConfigured(bool? foreground) async {
     // Only reconfigure if setting changed
     if (_isConfigured && _lastForegroundSetting == foreground) return;
+
+    // Ensure the background_downloader temp/cache directory exists on all
+    // platforms. macOS sandboxed apps don't auto-create the Caches subdirectory
+    // that background_downloader expects, causing PathNotFoundException.
+    // Creating it up-front is harmless on platforms where it already exists.
+    try {
+      final cacheDir = await getApplicationCacheDirectory();
+      debugPrint('📁 [SmartDownloader] Cache dir path: ${cacheDir.path}');
+      debugPrint('📁 [SmartDownloader] Cache dir exists: ${cacheDir.existsSync()}');
+      if (!cacheDir.existsSync()) {
+        await cacheDir.create(recursive: true);
+        debugPrint('📁 [SmartDownloader] Created cache directory');
+      }
+      // Also check/create the parent Caches directory explicitly, since
+      // background_downloader writes temp files as siblings or children
+      final parentCaches = cacheDir.parent;
+      debugPrint('📁 [SmartDownloader] Parent caches path: ${parentCaches.path}');
+      debugPrint('📁 [SmartDownloader] Parent caches exists: ${parentCaches.existsSync()}');
+      if (!parentCaches.existsSync()) {
+        await parentCaches.create(recursive: true);
+        debugPrint('📁 [SmartDownloader] Created parent caches directory');
+      }
+      // List contents of cache dir to see what's there
+      try {
+        final entries = cacheDir.listSync();
+        debugPrint('📁 [SmartDownloader] Cache dir contents (${entries.length} items):');
+        for (final entry in entries) {
+          debugPrint('📁   ${entry.path}');
+        }
+      } catch (e) {
+        debugPrint('📁 [SmartDownloader] Could not list cache dir: $e');
+      }
+    } catch (e) {
+      debugPrint('⚠️ Could not ensure cache directory: $e');
+    }
 
     final downloader = FileDownloader();
 
@@ -296,6 +333,15 @@ class SmartDownloader {
 
         await completer.future;
         return;
+      }
+
+      // Ensure the target directory exists before starting the download.
+      // On sandboxed macOS the Documents folder may not exist inside the
+      // container until something explicitly creates it.
+      final targetDir = Directory(targetPath).parent;
+      if (!targetDir.existsSync()) {
+        await targetDir.create(recursive: true);
+        debugPrint('📁 Created target directory: ${targetDir.path}');
       }
 
       final (baseDirectory, directory, filename) = await Task.split(filePath: targetPath);
