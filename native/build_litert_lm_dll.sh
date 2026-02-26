@@ -206,9 +206,13 @@ BUILD_BACKUP="$BUILD_FILE.flutter_gemma_backup"
 HEADER_BACKUP="$HEADER_FILE.flutter_gemma_backup"
 SOURCE_BACKUP="$SOURCE_FILE.flutter_gemma_backup"
 
+LOCKFILE="$LITERT_LM_DIR/cargo-bazel-lock.json"
+LOCKFILE_BACKUP="$LOCKFILE.flutter_gemma_backup"
+
 cp "$BUILD_FILE" "$BUILD_BACKUP"
 cp "$HEADER_FILE" "$HEADER_BACKUP"
 cp "$SOURCE_FILE" "$SOURCE_BACKUP"
+[ -f "$LOCKFILE" ] && cp "$LOCKFILE" "$LOCKFILE_BACKUP"
 
 # ============================================================================
 # Patch PATCH.rules_rust: add x86_64-apple-darwin to supported triples
@@ -453,6 +457,11 @@ cleanup() {
         rm -f "$RULES_RUST_PATCH_BACKUP"
         echo "  Restored original PATCH.rules_rust"
     fi
+    if [ -n "${LOCKFILE_BACKUP:-}" ] && [ -f "$LOCKFILE_BACKUP" ]; then
+        cp "$LOCKFILE_BACKUP" "$LOCKFILE"
+        rm -f "$LOCKFILE_BACKUP"
+        echo "  Restored original cargo-bazel-lock.json"
+    fi
 }
 trap cleanup EXIT
 
@@ -467,8 +476,49 @@ echo ""
 
 cd "$LITERT_LM_DIR"
 
+# CARGO_BAZEL_REPIN=true regenerates the crate lockfile when our
+# PATCH.rules_rust adds new platform triples (e.g. x86_64-apple-darwin)
+# that change the crate resolution digest.
+#
+# On macOS, pass DEVELOPER_DIR so Bazel's toolchain recognises Xcode system
+# headers even if Xcode is installed at a non-standard path (e.g.
+# /Volumes/NVMe/Xcode.app instead of /Applications/Xcode.app).
+BAZEL_MACOS_FLAGS=""
+if [ "$OS" = "Darwin" ]; then
+    XCODE_DEV_DIR="$(xcode-select -p 2>/dev/null || echo "")"
+    if [ -n "$XCODE_DEV_DIR" ]; then
+        BAZEL_MACOS_FLAGS="--repo_env=DEVELOPER_DIR=$XCODE_DEV_DIR --action_env=DEVELOPER_DIR=$XCODE_DEV_DIR"
+
+        # ---------------------------------------------------------------
+        # Fix for non-standard Xcode locations (e.g. /Volumes/NVMe/Xcode.app)
+        # ---------------------------------------------------------------
+        # Apple's Bazel toolchain (build_bazel_apple_support) hardcodes
+        # cxx_builtin_include_directories to /Applications/, /Library/, etc.
+        # If Xcode is installed elsewhere (external drive, custom path),
+        # Bazel rejects every system header as "absolute path inclusion".
+        # We patch the generated BUILD file to add the real Xcode prefix.
+        XCODE_PREFIX=$(dirname "$(dirname "$XCODE_DEV_DIR")")  # e.g. /Volumes/NVMe/Xcode.app
+        XCODE_VOLUME=$(echo "$XCODE_PREFIX" | cut -d'/' -f1-3)  # e.g. /Volumes/NVMe
+        if [[ "$XCODE_VOLUME" != "/Applications" ]]; then
+            # Wait for Bazel to generate local_config_apple_cc, then patch it
+            APPLE_CC_BUILD=""
+            for candidate in /private/var/tmp/_bazel_"$USER"/*/external/local_config_apple_cc/BUILD; do
+                if [ -f "$candidate" ]; then
+                    APPLE_CC_BUILD="$candidate"
+                    break
+                fi
+            done
+            if [ -n "$APPLE_CC_BUILD" ] && ! grep -q "$XCODE_VOLUME" "$APPLE_CC_BUILD"; then
+                sed -i.bak "s|cxx_builtin_include_directories = \[|cxx_builtin_include_directories = [\n            \"$XCODE_VOLUME/\",|" "$APPLE_CC_BUILD"
+                rm -f "$APPLE_CC_BUILD.bak"
+                echo "  Patched cc_toolchain: added $XCODE_VOLUME/ to builtin includes"
+            fi
+        fi
+    fi
+fi
+
 # shellcheck disable=SC2086
-$BAZEL build $BAZEL_TARGET $BAZEL_EXTRA
+CARGO_BAZEL_REPIN=true $BAZEL build $BAZEL_TARGET $BAZEL_EXTRA $BAZEL_MACOS_FLAGS
 
 echo ""
 echo "Build succeeded!"
