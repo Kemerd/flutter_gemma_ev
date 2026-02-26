@@ -36,17 +36,18 @@ fi
 
 echo "App bundle: $APP_BUNDLE"
 
-# Architecture detection — only Apple Silicon supported
+# Architecture detection — Apple Silicon has prebuilts, Intel builds from source
 ARCH=$(uname -m)
 if [[ "$ARCH" == "arm64" ]]; then
     NATIVE_ARCH="macos_arm64"
+elif [[ "$ARCH" == "x86_64" ]]; then
+    NATIVE_ARCH="macos_x86_64"
 else
-    echo "WARNING: Intel Mac (x86_64) is not supported by LiteRT-LM prebuilts"
-    echo "  Desktop support requires Apple Silicon (M1/M2/M3/M4)"
+    echo "WARNING: Unsupported macOS architecture: $ARCH"
     exit 0
 fi
 
-# Libraries we need for macOS ARM64:
+# Libraries we need for macOS (arm64 + x86_64):
 #   - liblitert_lm_capi.dylib — main C API library (built from source via native/build_litert_lm_dll.sh)
 #   - Accelerator .dylib files — from LiteRT-LM/prebuilt/
 PREBUILT_LIBS=(
