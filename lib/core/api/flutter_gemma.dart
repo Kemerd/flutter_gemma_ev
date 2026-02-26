@@ -4,6 +4,7 @@ import 'package:flutter_gemma/core/api/embedding_installation_builder.dart';
 import 'package:flutter_gemma/core/di/service_registry.dart';
 import 'package:flutter_gemma/core/domain/model_source.dart';
 import 'package:flutter_gemma/core/domain/web_storage_mode.dart';
+import 'package:flutter_gemma/core/infrastructure/platform_file_system_service.dart';
 import 'package:flutter_gemma/core/infrastructure/web_download_service_stub.dart'
     if (dart.library.js_interop) 'package:flutter_gemma/core/infrastructure/web_download_service.dart';
 import 'package:flutter_gemma/core/model.dart';
@@ -122,8 +123,11 @@ class FlutterGemma {
   }) async {
     // Configure custom model storage directory before anything else so
     // that subsequent path lookups already resolve to the right location.
+    // Both systems must agree: ModelFileSystemManager handles validation /
+    // cleanup paths, PlatformFileSystemService handles download targets.
     if (modelStorageDirectory != null) {
       ModelFileSystemManager.setModelStorageDirectory(modelStorageDirectory);
+      PlatformFileSystemService.setCustomBaseDirectory(modelStorageDirectory);
     }
 
     // Migration: enableWebCache takes precedence if provided (for backward compatibility)

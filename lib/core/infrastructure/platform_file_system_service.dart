@@ -12,9 +12,28 @@ import 'package:flutter_gemma/core/services/file_system_service.dart';
 /// - Supports Android and iOS
 /// - Automatic parent directory creation
 /// - External file registration tracking
+/// - Optional custom base directory (e.g. external NVMe on macOS)
 class PlatformFileSystemService implements FileSystemService {
   // Cache for app documents directory
   Directory? _documentsDirectory;
+
+  // ---------------------------------------------------------------------------
+  // Custom Model Storage Directory
+  // ---------------------------------------------------------------------------
+  // Mirrors ModelFileSystemManager._customModelStorageDir — when set, model
+  // downloads land here instead of getApplicationDocumentsDirectory(). This
+  // is the path that NetworkSourceHandler / SmartDownloader will actually use.
+  // ---------------------------------------------------------------------------
+
+  static String? _customBaseDirectory;
+
+  /// Override the default base directory for model file storage.
+  ///
+  /// Must be kept in sync with [ModelFileSystemManager.setModelStorageDirectory].
+  /// Both are set together from [FlutterGemma.initialize].
+  static void setCustomBaseDirectory(String? directory) {
+    _customBaseDirectory = directory;
+  }
 
   @override
   Future<void> writeFile(String filePath, Uint8List data) async {
@@ -132,11 +151,23 @@ class PlatformFileSystemService implements FileSystemService {
     // The actual tracking is done in ProtectedFilesRegistry.registerExternalPath()
   }
 
-  /// Gets the app documents directory with caching
+  /// Gets the base directory for model file storage.
+  ///
+  /// Returns the custom override if set, otherwise falls back to the
+  /// platform's application documents directory. Result is cached.
   Future<Directory> _getDocumentsDirectory() async {
-    // Web doesn't support local file system
     if (kIsWeb) {
       throw UnsupportedError('Local file system not supported on web platform');
+    }
+
+    // Invalidate cache when custom dir changes (e.g. hot-restart in dev)
+    if (_customBaseDirectory != null) {
+      final customDir = Directory(_customBaseDirectory!);
+      if (!await customDir.exists()) {
+        await customDir.create(recursive: true);
+      }
+      _documentsDirectory = customDir;
+      return customDir;
     }
 
     if (_documentsDirectory != null) {
