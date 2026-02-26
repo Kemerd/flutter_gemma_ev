@@ -211,6 +211,46 @@ cp "$HEADER_FILE" "$HEADER_BACKUP"
 cp "$SOURCE_FILE" "$SOURCE_BACKUP"
 
 # ============================================================================
+# Patch PATCH.rules_rust: add x86_64-apple-darwin to supported triples
+# ============================================================================
+# The upstream LiteRT-LM repo patches rules_rust's SUPPORTED_PLATFORM_TRIPLES
+# to add iOS/Android, but omits x86_64-apple-darwin (Intel Mac). Without it,
+# the Rust crate resolver marks all crates as @platforms//:incompatible on
+# Intel Macs and the build fails at analysis time.
+#
+# This is a patch-on-a-patch: we add the missing triple to the existing
+# PATCH.rules_rust so crate resolution includes macOS x86_64 targets.
+
+RULES_RUST_PATCH="$LITERT_LM_DIR/PATCH.rules_rust"
+if [ -f "$RULES_RUST_PATCH" ]; then
+    RULES_RUST_PATCH_BACKUP="$RULES_RUST_PATCH.flutter_gemma_backup"
+    cp "$RULES_RUST_PATCH" "$RULES_RUST_PATCH_BACKUP"
+
+    if ! grep -q "x86_64-apple-darwin" "$RULES_RUST_PATCH"; then
+        # Overwrite with corrected patch — sed on a diff file is too fragile.
+        # This is the upstream patch + x86_64-apple-darwin added.
+        cat > "$RULES_RUST_PATCH" << 'PATCHEOF'
+--- crate_universe/private/crates_repository.bzl	2025-05-01 16:41:19.000000000 -0700
++++ crate_universe/private/crates_repository.bzl	2025-06-19 10:31:33.225901444 -0700
+@@ -28,6 +28,10 @@
+ # complexity for each platform triple added.
+ SUPPORTED_PLATFORM_TRIPLES = [
+     "aarch64-apple-darwin",
++    "aarch64-apple-ios",
++    "aarch64-apple-ios-sim",
++    "aarch64-linux-android",
++    "x86_64-apple-darwin",
+     "aarch64-unknown-linux-gnu",
+     "wasm32-unknown-unknown",
+     "wasm32-wasip1",
+PATCHEOF
+        echo "  Patched PATCH.rules_rust: added x86_64-apple-darwin triple"
+    else
+        echo "  PATCH.rules_rust already has x86_64-apple-darwin"
+    fi
+fi
+
+# ============================================================================
 # Patch engine.h: add litert_lm_engine_settings_set_dispatch_lib_dir
 # ============================================================================
 # The upstream C API is missing a setter for the LiteRT dispatch library
@@ -407,6 +447,11 @@ cleanup() {
     if [ -f "$STUB_FILE" ]; then
         rm -f "$STUB_FILE"
         echo "  Removed capi_dll_entry.cc"
+    fi
+    if [ -n "${RULES_RUST_PATCH_BACKUP:-}" ] && [ -f "$RULES_RUST_PATCH_BACKUP" ]; then
+        cp "$RULES_RUST_PATCH_BACKUP" "$RULES_RUST_PATCH"
+        rm -f "$RULES_RUST_PATCH_BACKUP"
+        echo "  Restored original PATCH.rules_rust"
     fi
 }
 trap cleanup EXIT
