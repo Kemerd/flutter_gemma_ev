@@ -1,21 +1,28 @@
 part of 'flutter_gemma_desktop.dart';
 
 // =============================================================================
-// Desktop Embedding Model — ONNX Runtime + SentencePiece, Pure Dart
+// ONNX Embedding Model — ONNX Runtime + SentencePiece, Pure Dart
 // =============================================================================
 // Loads an EmbeddingGemma ONNX model via the onnxruntime package's FFI
 // bindings and runs inference using ONNX Runtime's native C++ thread pool.
 //
-// The mobile platforms use MediaPipe's native TextEmbedder through Pigeon,
-// but that native API isn't available on desktop.  This class replicates the
-// same functionality using:
+// Born on desktop (hence the name), now shared with iOS: nothing in here is
+// desktop-bound. The fork's loader resolves the ONNX Runtime C API from
+// libonnxruntime.dylib/.dll/.so on desktop and from the app executable
+// (DynamicLibrary.process(), statically linked onnxruntime-c pod) on iOS.
+//
+// Built from:
 //   1. SentencePieceTokenizer  — pure Dart protobuf parser + Viterbi encoder
 //   2. onnxruntime              — Dart FFI bindings to the ONNX Runtime C API
 //
-// Key advantages over the previous TFLite implementation:
+// What it buys over the native TFLite path:
 //   - Multi-core parallel inference via ortParallel execution mode
-//   - Hardware acceleration via DirectML (Windows GPU), CUDA, CoreML, etc.
+//   - Hardware acceleration: CoreML (Apple Neural Engine / GPU) on iOS and
+//     macOS, DirectML / CUDA on Windows — unsupported ops (e.g. the Q4
+//     MatMulNBits kernels) fall back to ONNX Runtime's optimized CPU EP
 //   - Non-blocking inference via runOnceAsync() (spawns isolates for FFI calls)
+//   - Session build + warm-up on a helper isolate, so CoreML partition
+//     compiles never freeze the UI (on iOS the UI isolate IS the main thread)
 //   - External data file support (.onnx + .onnx_data) for large quantized models
 //
 // The ONNX model uses two files: model_q4.onnx (graph, ~519KB) and
@@ -31,10 +38,11 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   /// The ONNX Runtime session — shared across all inference calls.
   /// ONNX Runtime's C++ thread pool handles multi-core distribution internally,
   /// so a single session can serve concurrent requests safely.
+  ///
+  /// Built on a helper isolate and adopted here by native address. Its
+  /// session options were released on that isolate right after creation —
+  /// ONNX Runtime copies everything it needs into the session.
   final OrtSession _session;
-
-  /// Session options — must be kept alive for the duration of the session.
-  final OrtSessionOptions _sessionOptions;
 
   /// Run options — reusable across inference calls (stateless).
   final OrtRunOptions _runOptions;
@@ -60,24 +68,45 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   /// Guard against use-after-close.
   bool _isClosed = false;
 
+  // -------------------------------------------------------------------------
+  // Run-slot limiter
+  // -------------------------------------------------------------------------
+  // Every in-flight Run() allocates its own activation buffers from the ORT
+  // arena, so peak memory scales with concurrency. Desktop has RAM to spare
+  // and stays unbounded (null). Phones get a small cap so a 16-chunk indexing
+  // burst can't balloon the arena into jetsam territory.
+
+  /// Max simultaneous Run() calls, or null for no limit.
+  final int? _maxConcurrentRuns;
+
+  /// Run() calls currently holding a slot.
+  int _activeRuns = 0;
+
+  /// Callers parked until a slot frees up (FIFO, so order is preserved).
+  final Queue<Completer<void>> _runWaiters = Queue<Completer<void>>();
+
+  /// Completed once the last in-flight run lets go — close() waits on it so
+  /// the native session is never freed under a running inference.
+  Completer<void>? _drained;
+
   DesktopEmbeddingModel._({
     required OrtSession session,
-    required OrtSessionOptions sessionOptions,
     required OrtRunOptions runOptions,
     required SentencePieceTokenizer tokenizer,
     required int maxSeqLength,
     required int embeddingDim,
     required List<String> inputNames,
     required String outputName,
+    required int? maxConcurrentRuns,
     required this.onClose,
   })  : _session = session,
-        _sessionOptions = sessionOptions,
         _runOptions = runOptions,
         _tokenizer = tokenizer,
         _maxSeqLength = maxSeqLength,
         _embeddingDim = embeddingDim,
         _inputNames = inputNames,
-        _outputName = outputName;
+        _outputName = outputName,
+        _maxConcurrentRuns = maxConcurrentRuns;
 
   // -------------------------------------------------------------------------
   // Factory constructor — loads model + tokenizer, configures ONNX session
@@ -87,7 +116,9 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   ///
   /// [modelPath]      — path to the .onnx embedding model file
   /// [tokenizerPath]  — path to the sentencepiece.model tokenizer file
-  /// [preferredBackend] — CPU or GPU hint (auto-detected via appendDefaultProviders)
+  /// [preferredBackend] — [PreferredBackend.cpu] pins the session to the
+  ///                      ONNX Runtime CPU EP; anything else (gpu / null)
+  ///                      auto-detects accelerators via appendDefaultProviders
   /// [onClose]        — callback when the model is closed
   static Future<DesktopEmbeddingModel> create({
     required String modelPath,
@@ -96,190 +127,309 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     required VoidCallback onClose,
   }) async {
     // -----------------------------------------------------------------
-    // Load the SentencePiece tokenizer (pure Dart, no FFI needed)
+    // Validate inputs up front — cheap checks beat a cryptic ORT error
+    // -----------------------------------------------------------------
+    if (modelPath.trim().isEmpty || tokenizerPath.trim().isEmpty) {
+      throw ArgumentError(
+        'Model and tokenizer paths must be non-empty '
+        '(model: "$modelPath", tokenizer: "$tokenizerPath")',
+      );
+    }
+    final modelFile = File(modelPath);
+    if (!modelFile.existsSync()) {
+      throw FileSystemException('Model file not found', modelPath);
+    }
+    debugPrint('[DesktopEmbedding] Loading ONNX model from: $modelPath '
+        '(${modelFile.lengthSync()} bytes)');
+
+    // Companion .onnx_data must sit next to the graph for ONNX Runtime to
+    // resolve the external weights. Missing is only a warning: small models
+    // can embed their weights in the .onnx itself.
+    final dataFile = File('${modelPath}_data');
+    if (dataFile.existsSync()) {
+      debugPrint('[DesktopEmbedding] Companion data file found: '
+          '${dataFile.path} '
+          '(${(dataFile.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB)');
+    } else {
+      debugPrint('[DesktopEmbedding] WARNING: No companion data file at: '
+          '${dataFile.path} — model may fail if it references external data');
+    }
+
+    // -----------------------------------------------------------------
+    // Load the SentencePiece tokenizer (pure Dart, no FFI needed).
+    // Parsing ~262k vocab pieces is real work, so it happens on a helper
+    // isolate; Isolate.exit hands the finished object back without a copy.
     // -----------------------------------------------------------------
     debugPrint('[DesktopEmbedding] Loading tokenizer from: $tokenizerPath');
-    final tokenizer = await SentencePieceTokenizer.load(tokenizerPath);
+    final tokenizer = await _loadTokenizer(tokenizerPath);
     debugPrint('[DesktopEmbedding] Tokenizer loaded — '
         '${tokenizer.vocabSize} pieces');
 
     // -----------------------------------------------------------------
-    // Initialize ONNX Runtime environment (singleton, safe to call multiple
-    // times — subsequent calls are no-ops if already initialized)
+    // Initialize ONNX Runtime environment on this (UI) isolate. ORT keeps
+    // one native env per process, so the loader isolate below attaches to
+    // this very same env — tensors and run options made here stay valid.
     // -----------------------------------------------------------------
     OrtEnv.instance.init();
     debugPrint('[DesktopEmbedding] ONNX Runtime v${OrtEnv.version} initialized');
 
     // -----------------------------------------------------------------
-    // Configure session options for maximum throughput
+    // Platform tuning
     // -----------------------------------------------------------------
-    final sessionOptions = OrtSessionOptions();
+    // Desktop: every core, exactly as before (0 = let ONNX Runtime decide),
+    // and no cap on concurrent runs.
+    //
+    // Mobile: phones pair a couple of performance cores with a cluster of
+    // efficiency cores. "All cores" drags the slow cluster into every matmul
+    // and keeps spin-waiting threads hot, which costs battery and thermals.
+    // Half the cores (clamped to 2..4) keeps the P-cores fed, leaves room
+    // for the UI, and two concurrent runs keep peak arena memory bounded.
+    final isMobile = Platform.isIOS || Platform.isAndroid;
+    final intraOpThreads =
+        isMobile ? (Platform.numberOfProcessors ~/ 2).clamp(2, 4) : 0;
+    final interOpThreads = isMobile ? 2 : 0;
+    final int? maxConcurrentRuns = isMobile ? 2 : null;
 
-    // Let ONNX Runtime use all available CPU cores for both inter-op
-    // (parallel operator execution) and intra-op (parallelism within
-    // individual operators like matrix multiplications).
-    // 0 = "let ONNX Runtime decide" (uses all cores).
-    sessionOptions.setInterOpNumThreads(0);
-    sessionOptions.setIntraOpNumThreads(0);
+    // CPU hint = skip accelerator probing entirely. Default (gpu / null)
+    // keeps the auto-detect path: CoreML on Apple, DirectML / CUDA on PC.
+    final useAccelerators = preferredBackend != PreferredBackend.cpu;
 
-    // Enable all graph optimizations (constant folding, node fusion, etc.)
-    sessionOptions.setSessionGraphOptimizationLevel(
-      GraphOptimizationLevel.ortEnableAll,
+    debugPrint('[DesktopEmbedding] Session config: ortParallel, all '
+        'optimizations, intra=$intraOpThreads inter=$interOpThreads '
+        '(0 = auto), accelerators=$useAccelerators, '
+        'maxConcurrentRuns=${maxConcurrentRuns ?? 'unbounded'}');
+
+    // -----------------------------------------------------------------
+    // Build session + warm-up probe on a helper isolate
+    // -----------------------------------------------------------------
+    // OrtSession.fromFile() and the first Run() are synchronous FFI calls:
+    // they read ~200 MB of weights, run graph optimization, and (with
+    // CoreML) compile every accelerated partition. Doing that here would
+    // freeze the UI — and on iOS the UI isolate is the platform main thread.
+    const probeSeqLength = 256;
+    final stopwatch = Stopwatch()..start();
+    final loaded = await _loadSession(
+      modelPath: modelPath,
+      useAccelerators: useAccelerators,
+      intraOpThreads: intraOpThreads,
+      interOpThreads: interOpThreads,
+      bosId: tokenizer.bosId,
+      probeSeqLength: probeSeqLength,
     );
+    debugPrint('[DesktopEmbedding] Session built + warmed up off the UI '
+        'thread in ${stopwatch.elapsedMilliseconds} ms');
 
-    // Parallel execution mode — allows independent operators in the
-    // computation graph to run concurrently on the C++ thread pool.
-    sessionOptions.setSessionExecutionMode(
-      OrtSessionExecutionMode.ortParallel,
-    );
-
-    debugPrint('[DesktopEmbedding] Session options configured '
-        '(ortParallel, all optimizations, auto threads)');
-
-    // -----------------------------------------------------------------
-    // Append hardware acceleration providers (auto-detect best available)
-    // -----------------------------------------------------------------
-    // This tries DirectML (Windows GPU), CUDA (NVIDIA), CoreML (Apple),
-    // NNAPI (Android), etc. in priority order, with CPU as final fallback.
-    await sessionOptions.appendDefaultProviders();
-    debugPrint('[DesktopEmbedding] Execution providers appended '
-        '(auto-detected best available hardware)');
-
-    // -----------------------------------------------------------------
-    // Create the ONNX session from file
-    // -----------------------------------------------------------------
-    // IMPORTANT: We use fromFile() (not fromBuffer) because the ONNX model
-    // has external data (model_q4.onnx_data). fromFile() lets the runtime
-    // auto-resolve the companion .onnx_data file from the same directory.
-    debugPrint('[DesktopEmbedding] Loading ONNX model from: $modelPath');
-    debugPrint('[DesktopEmbedding] Path codeUnits: ${modelPath.codeUnits}');
-    debugPrint('[DesktopEmbedding] Path length: ${modelPath.length}');
-    debugPrint('[DesktopEmbedding] Platform.isWindows: ${Platform.isWindows}');
-    final modelFile = File(modelPath);
-    if (!modelFile.existsSync()) {
-      throw FileSystemException('Model file not found', modelPath);
-    }
-    debugPrint('[DesktopEmbedding] Model file size: '
-        '${modelFile.lengthSync()} bytes');
-
-    // Check companion .onnx_data file exists in the same directory
-    final dataFilePath = '${modelPath}_data';
-    final dataFile = File(dataFilePath);
-    if (dataFile.existsSync()) {
-      debugPrint('[DesktopEmbedding] Companion data file found: $dataFilePath '
-          '(${(dataFile.lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB)');
-    } else {
-      debugPrint('[DesktopEmbedding] WARNING: No companion data file at: '
-          '$dataFilePath — model may fail if it references external data');
-    }
-
-    debugPrint('[DesktopEmbedding] Creating OrtSession.fromFile()...');
-    final session = OrtSession.fromFile(modelFile, sessionOptions);
-    debugPrint('[DesktopEmbedding] OrtSession created successfully');
-
-    // -----------------------------------------------------------------
-    // Inspect input/output tensor names and shapes
-    // -----------------------------------------------------------------
+    // Adopt the native session by address (no copy, same process memory)
+    final session = OrtSession.fromAddress(loaded.sessionAddress);
     final inputNames = session.inputNames;
-    final outputNames = session.outputNames;
 
     debugPrint('[DesktopEmbedding] Input tensors: $inputNames');
-    debugPrint('[DesktopEmbedding] Output tensors: $outputNames');
-
-    // Determine which output tensor to use for the embedding vector.
-    // EmbeddingGemma ONNX has two outputs:
-    //   - "last_hidden_state"   [1, seq_len, 768] — full transformer output
-    //   - "sentence_embedding"  [1, 768]           — pooled embedding (what we want)
-    // We prefer "sentence_embedding" if available; fall back to first output.
-    const preferredOutputName = 'sentence_embedding';
-    final outputName = outputNames.contains(preferredOutputName)
-        ? preferredOutputName
-        : outputNames.first;
-    debugPrint('[DesktopEmbedding] Using output tensor: "$outputName" '
-        '(available: $outputNames)');
-
-    // Run a probe inference to discover the embedding dimension at runtime.
-    // ONNX models with dynamic axes don't expose shapes statically.
-    const probeSeqLength = 256;
-
-    final probeTokens = Int64List(probeSeqLength);
-    probeTokens[0] = tokenizer.bosId; // BOS token, rest are zeros (padding)
-    final probeInput = OrtValueTensor.createTensorWithDataList(
-      probeTokens,
-      [1, probeSeqLength],
-    );
-
-    // Build probe inputs map — handle models with attention_mask input
-    final probeInputs = <String, OrtValue>{};
-    probeInputs[inputNames.first] = probeInput;
-
-    // If model expects attention_mask, provide it (1 for BOS, 0 for padding)
-    if (inputNames.length >= 2) {
-      final attentionMask = Int64List(probeSeqLength);
-      attentionMask[0] = 1; // Only BOS token is "real"
-      final maskTensor = OrtValueTensor.createTensorWithDataList(
-        attentionMask,
-        [1, probeSeqLength],
-      );
-      probeInputs[inputNames[1]] = maskTensor;
-    }
-
-    // If model expects token_type_ids, provide all zeros
-    if (inputNames.length >= 3) {
-      final tokenTypeIds = Int64List(probeSeqLength);
-      final typeTensor = OrtValueTensor.createTensorWithDataList(
-        tokenTypeIds,
-        [1, probeSeqLength],
-      );
-      probeInputs[inputNames[2]] = typeTensor;
-    }
-
-    final runOptions = OrtRunOptions();
-
-    // Only request our chosen output tensor (not all of them)
-    final probeOutputs = session.run(runOptions, probeInputs, [outputName]);
-
-    // Extract embedding dimension from the probe output.
-    // Shape is [1, embeddingDim] for sentence_embedding — we need the last dim.
-    final probeOutput = probeOutputs.first as OrtValueTensor;
-    final probeValue = probeOutput.value;
-    debugPrint('[DesktopEmbedding] Probe output type: ${probeValue.runtimeType}');
-
-    // Walk into nested lists to find the innermost dimension
-    int embeddingDim;
-    dynamic inner = probeValue;
-    while (inner is List && inner.isNotEmpty && inner.first is List) {
-      inner = inner.first;
-    }
-    embeddingDim = (inner is List) ? inner.length : 0;
-
-    // Release probe tensors to free native memory
-    probeInput.release();
-    for (final entry in probeInputs.values) {
-      if (entry != probeInput) entry.release();
-    }
-    for (final output in probeOutputs) {
-      output?.release();
-    }
-
+    debugPrint('[DesktopEmbedding] Output tensors: ${session.outputNames}');
+    debugPrint('[DesktopEmbedding] Using output tensor: '
+        '"${loaded.outputName}"');
     debugPrint('[DesktopEmbedding] Sequence length: $probeSeqLength, '
-        'Embedding dim: $embeddingDim');
-    debugPrint('[DesktopEmbedding] Model has ${inputNames.length} '
-        'input tensor(s)');
+        'Embedding dim: ${loaded.embeddingDim}');
     debugPrint('[DesktopEmbedding] Ready — inference will NOT block '
         'the UI thread (runOnceAsync)');
 
     return DesktopEmbeddingModel._(
       session: session,
-      sessionOptions: sessionOptions,
-      runOptions: runOptions,
+      runOptions: OrtRunOptions(),
       tokenizer: tokenizer,
       maxSeqLength: probeSeqLength,
-      embeddingDim: embeddingDim,
+      embeddingDim: loaded.embeddingDim,
       inputNames: inputNames,
-      outputName: outputName,
+      outputName: loaded.outputName,
+      maxConcurrentRuns: maxConcurrentRuns,
       onClose: onClose,
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper-isolate loaders
+  // -------------------------------------------------------------------------
+
+  /// Parses the SentencePiece model on a helper isolate.
+  ///
+  /// Static with a single String parameter so the [Isolate.run] closure
+  /// captures nothing but the path.
+  static Future<SentencePieceTokenizer> _loadTokenizer(String tokenizerPath) {
+    return Isolate.run(
+      () => SentencePieceTokenizer.load(tokenizerPath),
+      debugName: 'SentencePieceLoader',
+    );
+  }
+
+  /// Creates the ONNX session and runs one probe inference on a helper
+  /// isolate, handing back only plain values (native address + metadata).
+  ///
+  /// Kept static with primitive parameters on purpose: the closure passed
+  /// to [Isolate.run] must not capture anything that can't cross isolates.
+  /// No finalizers are attached to ORT handles in the onnxruntime fork, so
+  /// the session survives this isolate exiting; the UI isolate owns it from
+  /// here on and frees it in [close].
+  static Future<({int sessionAddress, String outputName, int embeddingDim})>
+      _loadSession({
+    required String modelPath,
+    required bool useAccelerators,
+    required int intraOpThreads,
+    required int interOpThreads,
+    required int bosId,
+    required int probeSeqLength,
+  }) {
+    return Isolate.run(() async {
+      // Attaches to the process-wide native env the UI isolate created
+      OrtEnv.instance.init();
+
+      final sessionOptions = OrtSessionOptions();
+      final runOptions = OrtRunOptions();
+      OrtSession? session;
+
+      try {
+        // ---------------------------------------------------------------
+        // Configure session options for maximum throughput
+        // ---------------------------------------------------------------
+        // Inter-op: parallel operator execution. Intra-op: parallelism
+        // within a single operator (e.g. a big matmul). 0 = all cores.
+        sessionOptions.setInterOpNumThreads(interOpThreads);
+        sessionOptions.setIntraOpNumThreads(intraOpThreads);
+
+        // Enable all graph optimizations (constant folding, node fusion, etc.)
+        sessionOptions.setSessionGraphOptimizationLevel(
+          GraphOptimizationLevel.ortEnableAll,
+        );
+
+        // Parallel execution mode — independent operators in the graph
+        // (e.g. the Q/K/V projections) run concurrently on the pool.
+        sessionOptions.setSessionExecutionMode(
+          OrtSessionExecutionMode.ortParallel,
+        );
+
+        // ---------------------------------------------------------------
+        // Append hardware acceleration providers (auto-detect best)
+        // ---------------------------------------------------------------
+        // Tries CoreML (Apple), NNAPI, CUDA, DirectML, ... then XNNPACK,
+        // with the CPU EP always last. Providers a build doesn't ship are
+        // skipped inside. Any leftover failure (e.g. a stripped symbol on
+        // a static iOS link) must never cost us the model: ONNX Runtime
+        // always registers its CPU EP implicitly, so we log and carry on.
+        if (useAccelerators) {
+          try {
+            await sessionOptions.appendDefaultProviders();
+            debugPrint('[DesktopEmbedding] Execution providers appended '
+                '(auto-detected best available hardware)');
+          } catch (e) {
+            debugPrint('[DesktopEmbedding] Accelerator setup incomplete, '
+                'continuing with CPU fallback: $e');
+          }
+        }
+
+        // ---------------------------------------------------------------
+        // Create the ONNX session from file
+        // ---------------------------------------------------------------
+        // fromFile() (not fromBuffer) so ONNX Runtime can resolve the
+        // external .onnx_data weights from the same directory.
+        session = OrtSession.fromFile(File(modelPath), sessionOptions);
+        final inputNames = session.inputNames;
+        final outputNames = session.outputNames;
+        if (inputNames.isEmpty || outputNames.isEmpty) {
+          throw StateError('ONNX model exposes no inputs/outputs: '
+              'inputs=$inputNames outputs=$outputNames');
+        }
+
+        // Determine which output tensor to use for the embedding vector.
+        // EmbeddingGemma ONNX has two outputs:
+        //   - "last_hidden_state"   [1, seq_len, 768] — full transformer output
+        //   - "sentence_embedding"  [1, 768]           — pooled embedding (wanted)
+        // Prefer "sentence_embedding"; fall back to the first output.
+        const preferredOutputName = 'sentence_embedding';
+        final outputName = outputNames.contains(preferredOutputName)
+            ? preferredOutputName
+            : outputNames.first;
+
+        // ---------------------------------------------------------------
+        // Probe inference: discovers the embedding dimension (dynamic axes
+        // hide it statically) and pays the first-run warm-up cost here
+        // instead of on the user's first search.
+        // ---------------------------------------------------------------
+        final probeTensors = <OrtValue>[];
+        final probeInputs = <String, OrtValue>{};
+        List<OrtValue?> probeOutputs = const <OrtValue?>[];
+        try {
+          // Token IDs: BOS then zero padding
+          final probeTokens = Int64List(probeSeqLength);
+          probeTokens[0] = bosId;
+          final idsTensor = OrtValueTensor.createTensorWithDataList(
+            probeTokens,
+            [1, probeSeqLength],
+          );
+          probeTensors.add(idsTensor);
+          probeInputs[inputNames.first] = idsTensor;
+
+          // Attention mask (1 for BOS, 0 for padding) when the model wants it
+          if (inputNames.length >= 2) {
+            final attentionMask = Int64List(probeSeqLength);
+            attentionMask[0] = 1;
+            final maskTensor = OrtValueTensor.createTensorWithDataList(
+              attentionMask,
+              [1, probeSeqLength],
+            );
+            probeTensors.add(maskTensor);
+            probeInputs[inputNames[1]] = maskTensor;
+          }
+
+          // Token type IDs (all zeros) for three-input models
+          if (inputNames.length >= 3) {
+            final typeTensor = OrtValueTensor.createTensorWithDataList(
+              Int64List(probeSeqLength),
+              [1, probeSeqLength],
+            );
+            probeTensors.add(typeTensor);
+            probeInputs[inputNames[2]] = typeTensor;
+          }
+
+          // Only request our chosen output tensor (not all of them)
+          probeOutputs = session.run(runOptions, probeInputs, [outputName]);
+          if (probeOutputs.isEmpty || probeOutputs.first == null) {
+            throw StateError('Probe inference returned no output tensor');
+          }
+
+          // Walk into nested lists to find the innermost dimension.
+          // Shape is [1, embeddingDim] for sentence_embedding.
+          dynamic inner = (probeOutputs.first as OrtValueTensor).value;
+          while (inner is List && inner.isNotEmpty && inner.first is List) {
+            inner = inner.first;
+          }
+          final embeddingDim = (inner is List) ? inner.length : 0;
+          if (embeddingDim <= 0) {
+            throw StateError('Probe inference produced an empty embedding');
+          }
+
+          return (
+            sessionAddress: session.address,
+            outputName: outputName,
+            embeddingDim: embeddingDim,
+          );
+        } finally {
+          // Probe tensors are native memory — always free them
+          for (final tensor in probeTensors) {
+            tensor.release();
+          }
+          for (final output in probeOutputs) {
+            output?.release();
+          }
+        }
+      } catch (_) {
+        // Never leak a half-initialized ~200 MB session
+        await session?.release();
+        rethrow;
+      } finally {
+        // ONNX Runtime copied what it needs into the session; options and
+        // the probe's run options can go right away.
+        sessionOptions.release();
+        runOptions.release();
+      }
+    }, debugName: 'OnnxEmbeddingLoader');
   }
 
   // -------------------------------------------------------------------------
@@ -354,18 +504,35 @@ class DesktopEmbeddingModel extends EmbeddingModel {
   Future<List<double>> generateEmbedding(String text) async {
     _assertNotClosed();
 
+    // Wait for a run slot (instant on desktop, capped on mobile)
+    await _acquireRunSlot();
+    try {
+      // The model may have been closed while we were parked in the queue
+      _assertNotClosed();
+      return await _runInference(text);
+    } finally {
+      _releaseRunSlot();
+    }
+  }
+
+  /// One tokenize → Run() → unwrap round trip. Caller holds a run slot.
+  Future<List<double>> _runInference(String text) async {
     // Build input tensors from tokenized text
     final (:inputs, :tensors) = _buildInputs(text);
+    List<OrtValue?> outputs = const <OrtValue?>[];
 
     try {
       // Run inference on a background isolate via runOnceAsync().
       // This spawns a fresh Dart isolate that calls into the shared native
       // ONNX Runtime session via FFI, keeping the UI thread completely free.
-      final outputs = await _session.runOnceAsync(
+      outputs = await _session.runOnceAsync(
         _runOptions,
         inputs,
         [_outputName],
       );
+      if (outputs.isEmpty || outputs.first == null) {
+        throw StateError('ONNX inference returned no output tensor');
+      }
 
       // Extract the float embedding vector from the output tensor.
       // The ONNX output is typically nested: [1, embeddingDim] comes back
@@ -382,23 +549,17 @@ class DesktopEmbeddingModel extends EmbeddingModel {
       }
 
       // Convert from List<num> (which ONNX returns) to List<double>
-      final List<double> embedding;
       if (inner is List) {
-        embedding = inner.map<double>((e) => (e as num).toDouble()).toList();
-      } else {
-        throw StateError(
-          'Unexpected ONNX output shape: ${rawValue.runtimeType}',
-        );
+        return inner.map<double>((e) => (e as num).toDouble()).toList();
       }
-
-      // Release output tensors to free native memory
+      throw StateError(
+        'Unexpected ONNX output shape: ${rawValue.runtimeType}',
+      );
+    } finally {
+      // Always release native tensors regardless of success/failure
       for (final output in outputs) {
         output?.release();
       }
-
-      return embedding;
-    } finally {
-      // Always release input tensors regardless of success/failure
       for (final tensor in tensors) {
         tensor.release();
       }
@@ -413,9 +574,46 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     // Each runOnceAsync() call spawns its own isolate, allowing true parallel
     // inference — ONNX Runtime's C++ thread pool handles the native-level
     // concurrency. This is the same ortParallel pattern used in nihon_dojo's
-    // SharedSessionManager.runBatchInference().
+    // SharedSessionManager.runBatchInference(). On mobile the run-slot
+    // limiter meters these out so the arena stays small.
     final futures = texts.map((text) => generateEmbedding(text));
     return Future.wait(futures);
+  }
+
+  // -------------------------------------------------------------------------
+  // Run-slot limiter internals
+  // -------------------------------------------------------------------------
+
+  /// Claims a run slot, parking the caller FIFO when the cap is reached.
+  Future<void> _acquireRunSlot() async {
+    final limit = _maxConcurrentRuns;
+    if (limit == null || _activeRuns < limit) {
+      _activeRuns++;
+      return;
+    }
+
+    // Full — wait until _releaseRunSlot hands this caller a slot directly
+    final waiter = Completer<void>();
+    _runWaiters.add(waiter);
+    await waiter.future;
+  }
+
+  /// Returns a run slot: hands it straight to the next waiter if there is
+  /// one, otherwise frees it (and wakes close() once everything drained).
+  void _releaseRunSlot() {
+    if (_runWaiters.isNotEmpty) {
+      // Ownership transfer — the active count doesn't change
+      _runWaiters.removeFirst().complete();
+      return;
+    }
+
+    _activeRuns--;
+    if (_activeRuns <= 0) {
+      _activeRuns = 0;
+      final drained = _drained;
+      _drained = null;
+      if (drained != null && !drained.isCompleted) drained.complete();
+    }
   }
 
   @override
@@ -429,12 +627,19 @@ class DesktopEmbeddingModel extends EmbeddingModel {
     if (_isClosed) return;
     _isClosed = true;
 
+    // Let in-flight runs finish first: freeing the session under a running
+    // Run() is a native use-after-free. Parked callers wake up, see
+    // _isClosed and bail without touching the session, so this drains fast.
+    if (_activeRuns > 0) {
+      final drained = _drained ??= Completer<void>();
+      await drained.future;
+    }
+
     // Release ONNX Runtime resources in dependency order:
     // 1. Kill all isolates (stops background inference workers)
     // 2. Release the session (frees native model memory)
-    // 3. Release options objects (frees native config memory)
+    // 3. Release run options (session options were freed at load time)
     await _session.release();
-    _sessionOptions.release();
     _runOptions.release();
 
     // Notify the plugin singleton that this model is gone

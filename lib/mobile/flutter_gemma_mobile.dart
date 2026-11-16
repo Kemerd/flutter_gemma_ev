@@ -9,6 +9,11 @@ import 'package:path/path.dart' as path;
 import 'package:background_downloader/background_downloader.dart';
 
 import '../flutter_gemma.dart';
+// ONNX Runtime embedding backend (FFI). Web gets the stub twins, since
+// dart:ffi doesn't exist there.
+import '../desktop/flutter_gemma_desktop.dart'
+    if (dart.library.js_interop) '../desktop/flutter_gemma_desktop_stub.dart'
+    show createOnnxEmbeddingModel, isOnnxEmbeddingModel;
 import '../core/di/service_registry.dart';
 import '../core/domain/model_source.dart';
 import '../core/services/model_repository.dart' as repo;
@@ -404,6 +409,15 @@ class FlutterGemmaMobile extends FlutterGemmaPlugin {
         }
       }
 
+      // Creation already in flight (completer set, model not built yet) —
+      // share it instead of spinning up a second native session. An ONNX
+      // session pins ~200 MB of weights, so a duplicate is a jetsam risk.
+      if (_initEmbeddingCompleter case final inFlight?
+          when _initializedEmbeddingModel == null) {
+        debugPrint('ℹ️  Embedding model creation already in progress, sharing it');
+        return inFlight.future;
+      }
+
       modelPath = activeModelPath;
       tokenizerPath = activeTokenizerPath;
 
@@ -425,6 +439,9 @@ class FlutterGemmaMobile extends FlutterGemmaPlugin {
     if (activeModel != null) {
       final isModelInstalled = await manager.isModelInstalled(activeModel);
       if (!isModelInstalled) {
+        // Don't leave a dead completer behind — the in-flight guard above
+        // would otherwise hand this error back forever
+        _initEmbeddingCompleter = null;
         completer.completeError(
           Exception(
               'Active embedding model is no longer installed. Use the `modelManager` to load the model first'),
@@ -434,19 +451,38 @@ class FlutterGemmaMobile extends FlutterGemmaPlugin {
     }
 
     try {
-      await _platformService.createEmbeddingModel(
-        modelPath: modelPath,
-        tokenizerPath: tokenizerPath,
-        preferredBackend: preferredBackend,
-      );
+      // Same cleanup for either backend once the model is closed
+      void onClose() {
+        _initializedEmbeddingModel = null;
+        _initEmbeddingCompleter = null;
+        _lastActiveEmbeddingSpec = null;
+      }
 
-      final model = _initializedEmbeddingModel = MobileEmbeddingModel(
-        onClose: () {
-          _initializedEmbeddingModel = null;
-          _initEmbeddingCompleter = null;
-          _lastActiveEmbeddingSpec = null;
-        },
-      );
+      final EmbeddingModel model;
+      if (isOnnxEmbeddingModel(modelPath)) {
+        // ---------------------------------------------------------------
+        // ONNX graph (.onnx + .onnx_data): native TFLite can't parse it, so
+        // run it through ONNX Runtime over FFI — the same model class the
+        // desktop builds use, with CoreML (Neural Engine / GPU) and the CPU
+        // EP as fallback. Chat / inference routing is untouched.
+        // ---------------------------------------------------------------
+        debugPrint('Routing ONNX embedding model to ONNX Runtime: $modelPath');
+        model = await createOnnxEmbeddingModel(
+          modelPath: modelPath,
+          tokenizerPath: tokenizerPath,
+          preferredBackend: preferredBackend,
+          onClose: onClose,
+        );
+      } else {
+        // Native path (MediaPipe / TFLite via Pigeon)
+        await _platformService.createEmbeddingModel(
+          modelPath: modelPath,
+          tokenizerPath: tokenizerPath,
+          preferredBackend: preferredBackend,
+        );
+        model = MobileEmbeddingModel(onClose: onClose);
+      }
+      _initializedEmbeddingModel = model;
 
       // Save the spec that was used to create this model (Modern API path only)
       if (activeModel != null) {

@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
 import 'package:onnxruntime/onnxruntime.dart';
@@ -414,4 +416,43 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
 bool get isDesktop {
   if (kIsWeb) return false;
   return Platform.isMacOS || Platform.isWindows || Platform.isLinux;
+}
+
+// =============================================================================
+// ONNX Embedding Entry Points (shared with the mobile plugin)
+// =============================================================================
+// DesktopEmbeddingModel is pure Dart + ONNX Runtime FFI, so nothing about it
+// is actually desktop-bound. The mobile plugin (iOS) routes ONNX embedders
+// through these two functions while keeping its own singleton bookkeeping
+// and leaving chat / inference on the native MediaPipe path.
+//
+// Web never sees this file — it gets the stub twins via a conditional import.
+// =============================================================================
+
+/// Whether [modelPath] is an ONNX graph that has to run through ONNX Runtime.
+///
+/// The `.onnx` file is the graph; its weights live next to it in
+/// `<name>.onnx_data`, which ONNX Runtime resolves on its own.
+bool isOnnxEmbeddingModel(String modelPath) {
+  // Defensive: blank paths are never ONNX, they're a bug upstream
+  if (modelPath.trim().isEmpty) return false;
+  return modelPath.toLowerCase().endsWith('.onnx');
+}
+
+/// Builds an ONNX Runtime-backed [EmbeddingModel] for [modelPath].
+///
+/// Thin public wrapper around [DesktopEmbeddingModel.create] so libraries
+/// outside this one (the mobile plugin) can reach the `part` class.
+Future<EmbeddingModel> createOnnxEmbeddingModel({
+  required String modelPath,
+  required String tokenizerPath,
+  PreferredBackend? preferredBackend,
+  required VoidCallback onClose,
+}) {
+  return DesktopEmbeddingModel.create(
+    modelPath: modelPath,
+    tokenizerPath: tokenizerPath,
+    preferredBackend: preferredBackend,
+    onClose: onClose,
+  );
 }

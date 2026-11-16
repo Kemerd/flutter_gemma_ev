@@ -70,5 +70,13 @@ Includes support for Gemma 3 Nano models with optimized MediaPipe GenAI v0.10.24
     # Don't force_load on simulator (TensorFlowLiteSelectTfOps.xcframework only contains ios-arm64 slice)
     'OTHER_LDFLAGS[sdk=iphonesimulator*]' => '-lc++'
   }
+
+  # ONNX Runtime embeddings (dart:ffi) look up the ORT C API in the app
+  # executable via DynamicLibrary.process(): the onnxruntime-c pod is linked
+  # statically. Xcode's default "All Symbols" strip (archive / IPA builds)
+  # removes those global symbols, so dlsym() fails in TestFlight and App
+  # Store builds only. Non-global stripping keeps them — Flutter's documented
+  # requirement for FFI into statically linked code.
+  s.user_target_xcconfig = { 'STRIP_STYLE' => 'non-global' }
   s.swift_version = '5.0'
 end
