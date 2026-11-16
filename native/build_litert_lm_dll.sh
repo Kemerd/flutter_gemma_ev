@@ -138,7 +138,7 @@ if [ "$IOS_DEVICE" = true ]; then
     NATIVE_ARCH="ios_arm64"
     LIB_EXT="a"
     BUILD_STATIC=true
-    BAZEL_EXTRA="--config=ios_arm64"
+    BAZEL_EXTRA="--config=ios_arm64 --experimental_cc_static_library"
     echo "Target: iOS device (arm64, static library)"
 
 elif [ "$IOS_SIM" = true ]; then
@@ -148,7 +148,7 @@ elif [ "$IOS_SIM" = true ]; then
     NATIVE_ARCH="ios_sim_arm64"
     LIB_EXT="a"
     BUILD_STATIC=true
-    BAZEL_EXTRA="--config=ios_sim_arm64"
+    BAZEL_EXTRA="--config=ios_sim_arm64 --experimental_cc_static_library"
     echo "Target: iOS simulator (arm64, static library)"
 
 elif [ "$MACOS_ARM64" = true ]; then
@@ -238,6 +238,17 @@ if [ -z "$BAZEL" ]; then
     echo "ERROR: bazelisk or bazel not found in PATH" >&2
     echo "  Install: brew install bazelisk  OR  npm install -g @bazel/bazelisk" >&2
     exit 1
+fi
+
+# Redirect Bazel's output_base to the same volume as the source tree.
+# Default location (/private/var/tmp/) lives on the boot disk, which is often
+# small on Macs with external NVMe drives. Each cross-compile config uses ~7GB.
+SRC_VOLUME=$(df "$LITERT_LM_DIR" 2>/dev/null | awk 'NR==2{print $NF}')
+if [ "$SRC_VOLUME" != "/" ] && [ -d "$SRC_VOLUME" ]; then
+    BAZEL_OUTPUT_BASE="$SRC_VOLUME/bazel_cache"
+    mkdir -p "$BAZEL_OUTPUT_BASE"
+    BAZEL="$BAZEL --output_base=$BAZEL_OUTPUT_BASE"
+    echo "  Output base: $BAZEL_OUTPUT_BASE"
 fi
 
 # Wipe Bazel cache if --clean was passed
@@ -350,44 +361,51 @@ if [ -f "$WORKSPACE_FILE" ]; then
 fi
 
 # ============================================================================
-# Patch build_config + constrained_decoding BUILD for macOS x86_64
+# Patch constrained_decoding BUILD: skip broken prebuilt dylibs
 # ============================================================================
-# The upstream BUILD uses "@platforms//os:macos" which catches BOTH arm64 and
-# x86_64, but links prebuilt/macos_arm64 libs — arm64 binaries that the x86_64
-# linker rejects ("unknown file type"). We add a more specific macos_x86_64
-# config that selects before the generic macos entry and uses an empty list
-# (constrained decoding is optional; the engine falls back gracefully).
+# The upstream BUILD links prebuilt/macos_arm64/libGemmaModelConstraintProvider.dylib
+# for all macOS builds. This fails if:
+#   1. The prebuilt is a Git LFS pointer (not `git lfs pull`'d) — "unknown file type"
+#   2. Cross-compiling x86_64 — the x86_64 linker rejects arm64 binaries
+# Constrained decoding is optional — the engine falls back gracefully without it.
+# We replace the macos prebuilt entry with an empty list.
 
-BUILD_CONFIG="$LITERT_LM_DIR/build_config/BUILD"
 CONSTRAINED_BUILD="$LITERT_LM_DIR/runtime/components/constrained_decoding/BUILD"
+PREBUILT_DYLIB="$LITERT_LM_DIR/prebuilt/macos_arm64/libGemmaModelConstraintProvider.dylib"
 
-if [ "$NATIVE_ARCH" = "macos_x86_64" ]; then
-    # Add macos_x86_64 config_setting if missing
-    if [ -f "$BUILD_CONFIG" ] && ! grep -q "macos_x86_64" "$BUILD_CONFIG"; then
-        BUILD_CONFIG_BACKUP="$BUILD_CONFIG.flutter_gemma_backup"
-        cp "$BUILD_CONFIG" "$BUILD_CONFIG_BACKUP"
-        cat >> "$BUILD_CONFIG" << 'BLDCFG'
+# Check if ANY prebuilt is a valid binary (not a Git LFS pointer)
+PREBUILT_IS_LFS=false
+if [ -f "$PREBUILT_DYLIB" ] && head -1 "$PREBUILT_DYLIB" | grep -q "git-lfs"; then
+    PREBUILT_IS_LFS=true
+fi
 
-config_setting(
-    name = "macos_x86_64",
-    constraint_values = [
-        "@platforms//os:macos",
-        "@platforms//cpu:x86_64",
-    ],
+if [ "$PREBUILT_IS_LFS" = true ] && [ -f "$CONSTRAINED_BUILD" ]; then
+    CONSTRAINED_BACKUP="$CONSTRAINED_BUILD.flutter_gemma_backup"
+    cp "$CONSTRAINED_BUILD" "$CONSTRAINED_BACKUP"
+    # All prebuilt libs are LFS pointers — replace every platform's entry with []
+    # Uses Python for reliable multi-select patching across all platform entries
+    python3 - "$CONSTRAINED_BUILD" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path, "r") as f:
+    content = f.read()
+# Replace any prebuilt reference in the shared_library select with []
+content = re.sub(
+    r'\["//prebuilt/[^"]+:libGemmaModelConstraintProvider\.[^"]+"\]',
+    "[]",
+    content,
 )
-BLDCFG
-        echo "  Added macos_x86_64 config_setting to build_config/BUILD"
-    fi
-
-    # Patch constrained_decoding select to use empty srcs for x86_64 macOS
-    if [ -f "$CONSTRAINED_BUILD" ] && ! grep -q "macos_x86_64" "$CONSTRAINED_BUILD"; then
-        CONSTRAINED_BACKUP="$CONSTRAINED_BUILD.flutter_gemma_backup"
-        cp "$CONSTRAINED_BUILD" "$CONSTRAINED_BACKUP"
-        # Insert x86_64 case BEFORE the generic macos entry
-        sed -i.bak 's|"@platforms//os:macos": \["//prebuilt/macos_arm64:libGemmaModelConstraintProvider.dylib"\]|"//build_config:macos_x86_64": [],\n        "@platforms//os:macos": ["//prebuilt/macos_arm64:libGemmaModelConstraintProvider.dylib"]|' "$CONSTRAINED_BUILD"
-        rm -f "$CONSTRAINED_BUILD.bak"
-        echo "  Patched constrained_decoding BUILD: x86_64 uses empty srcs"
-    fi
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+    echo "  Patched constrained_decoding BUILD: removed LFS pointer prebuilts"
+elif [ "$NATIVE_ARCH" = "macos_x86_64" ] && [ -f "$CONSTRAINED_BUILD" ]; then
+    # Even with real binaries, x86_64 can't link arm64 prebuilts
+    CONSTRAINED_BACKUP="$CONSTRAINED_BUILD.flutter_gemma_backup"
+    cp "$CONSTRAINED_BUILD" "$CONSTRAINED_BACKUP"
+    sed -i.bak 's|"@platforms//os:macos": \["//prebuilt/macos_arm64:libGemmaModelConstraintProvider.dylib"\]|"@platforms//os:macos": []|' "$CONSTRAINED_BUILD"
+    rm -f "$CONSTRAINED_BUILD.bak"
+    echo "  Patched constrained_decoding BUILD: x86_64 uses empty srcs"
 fi
 
 # ============================================================================
@@ -536,21 +554,25 @@ if [ "$BUILD_STATIC" = true ]; then
 # flutter_gemma: Static library target for iOS
 # (auto-generated by build_litert_lm_dll.sh — DO NOT COMMIT)
 # ======================================================================
+# cc_static_library (Bazel 7+) creates a fat archive containing the full
+# transitive closure of object files from all deps. Unlike cc_library which
+# only archives its own srcs, this bundles the entire engine into one .a
+# file suitable for linking into the Flutter iOS plugin framework.
 cc_library(
     name = "engine_alwayslink",
+    srcs = ["capi_dll_entry.cc"],
     deps = [":engine"],
     alwayslink = True,
 )
 
-cc_library(
+cc_static_library(
     name = "litert_lm_capi_static",
-    srcs = ["capi_dll_entry.cc"],
     deps = [":engine_alwayslink"],
     visibility = ["//visibility:public"],
 )
 EOF
     BAZEL_TARGET="//c:litert_lm_capi_static"
-    echo "  Created cc_library target (static): $BAZEL_TARGET"
+    echo "  Created cc_static_library target: $BAZEL_TARGET"
 else
     # Desktop: shared library (.dylib / .so) loaded at runtime via Dart FFI
     cat >> "$BUILD_FILE" << 'EOF'
@@ -674,10 +696,13 @@ if [ "$OS" = "Darwin" ]; then
             # Fetch forces Bazel to generate local_config_apple_cc/BUILD
             # without compiling anything, so we can patch it before the build.
             # shellcheck disable=SC2086
-            CARGO_BAZEL_REPIN=true $BAZEL fetch $BAZEL_TARGET $BAZEL_MACOS_FLAGS 2>&1 || true
+            CARGO_BAZEL_REPIN=true $BAZEL fetch $BAZEL_TARGET $BAZEL_EXTRA $BAZEL_MACOS_FLAGS 2>&1 || true
 
             APPLE_CC_BUILD=""
-            for candidate in /private/var/tmp/_bazel_"$USER"/*/external/local_config_apple_cc/BUILD; do
+            # Search both the custom output_base (if set) and the default location
+            for candidate in \
+                "${BAZEL_OUTPUT_BASE:-/nonexistent}/external/local_config_apple_cc/BUILD" \
+                /private/var/tmp/_bazel_"$USER"/*/external/local_config_apple_cc/BUILD; do
                 if [ -f "$candidate" ]; then
                     APPLE_CC_BUILD="$candidate"
                     break
@@ -725,7 +750,9 @@ if [ "$BUILD_STATIC" = true ]; then
 
     if [ -n "$LIB_PATH" ]; then
         OUT_NAME="liblitert_lm_capi.a"
+        rm -f "$OUTPUT_DIR/$OUT_NAME" 2>/dev/null || true
         cp "$LIB_PATH" "$OUTPUT_DIR/$OUT_NAME"
+        chmod 644 "$OUTPUT_DIR/$OUT_NAME"
         size=$(du -h "$OUTPUT_DIR/$OUT_NAME" | cut -f1)
         echo "  $OUT_NAME ($size)"
     else
@@ -754,7 +781,9 @@ else
             OUT_NAME="liblitert_lm_capi.so"
         fi
 
+        rm -f "$OUTPUT_DIR/$OUT_NAME" 2>/dev/null || true
         cp "$LIB_PATH" "$OUTPUT_DIR/$OUT_NAME"
+        chmod 755 "$OUTPUT_DIR/$OUT_NAME"
         size=$(du -h "$OUTPUT_DIR/$OUT_NAME" | cut -f1)
         echo "  $OUT_NAME ($size)"
 
@@ -781,7 +810,9 @@ if [ "$BUILD_STATIC" = false ]; then
         for lib in "$PREBUILT_DIR"/*."$LIB_EXT" "$PREBUILT_DIR"/*.so; do
             [ -f "$lib" ] || continue
             filename=$(basename "$lib")
+            rm -f "$OUTPUT_DIR/$filename" 2>/dev/null || true
             cp "$lib" "$OUTPUT_DIR/$filename"
+            chmod 755 "$OUTPUT_DIR/$filename"
             echo "  $filename (accelerator)"
             if [ "$OS" = "Darwin" ]; then
                 codesign --force --sign - "$OUTPUT_DIR/$filename" 2>/dev/null || true

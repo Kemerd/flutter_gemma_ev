@@ -135,8 +135,20 @@ sign_lib() {
     local lib_path="$1"
     # Remove quarantine attribute (downloaded files get flagged)
     xattr -r -d com.apple.quarantine "$lib_path" 2>/dev/null || true
-    # Ad-hoc sign so macOS doesn't reject unsigned binaries
-    codesign --force --sign - "$lib_path" 2>/dev/null || true
+
+    # Sign with the same identity Xcode uses for the app when one is set
+    # (Apple Development / Apple Distribution / Developer ID). Mac App Store
+    # validation rejects nested code that is only ad-hoc signed, and the app's
+    # own signature (applied after this phase) then seals these files.
+    # Plain `flutter run` debug builds have no identity, so fall back to ad-hoc.
+    local identity="${EXPANDED_CODE_SIGN_IDENTITY:-}"
+    if [ -z "$identity" ] || [ "$identity" = "-" ]; then
+        identity="-"
+    fi
+    if ! codesign --force --sign "$identity" --timestamp=none "$lib_path"; then
+        echo "  [warn]     codesign with '$identity' failed for $(basename "$lib_path"), ad-hoc signing instead" >&2
+        codesign --force --sign - "$lib_path" 2>/dev/null || true
+    fi
 }
 
 # ============================================================================
@@ -152,9 +164,61 @@ install_prebuilt_libs() {
 }
 
 # ============================================================================
+# Universal C API library (arm64 + x86_64)
+# ============================================================================
+# The app is built as a universal binary, so the LiteRT-LM C API must contain
+# BOTH slices regardless of which Mac performs the build. Picking libraries by
+# `uname -m` (the build host) would silently ship an Intel-only engine to Apple
+# silicon users when building on an Intel Mac, and vice versa.
+#
+# When both per-arch builds from native/build_litert_lm_dll.sh are present we
+# merge them with lipo and bundle only that. Accelerator plugins are skipped:
+# the app runs LiteRT-LM on the CPU backend, and Google only ships the GPU
+# accelerators for arm64, which would leave a half-universal bundle.
+install_universal_capi() {
+    local arm="$PLUGIN_ROOT/native/prebuilt/macos_arm64/liblitert_lm_capi.dylib"
+    local x86="$PLUGIN_ROOT/native/prebuilt/macos_x86_64/liblitert_lm_capi.dylib"
+
+    # Both slices must be real Mach-O files (not Git LFS pointer stubs)
+    if ! lipo -archs "$arm" 2>/dev/null | grep -qw arm64; then return 1; fi
+    if ! lipo -archs "$x86" 2>/dev/null | grep -qw x86_64; then return 1; fi
+
+    echo ""
+    echo "=== Installing universal LiteRT-LM C API (arm64 + x86_64) ==="
+
+    local universal_cache="$HOME/Library/Caches/flutter_gemma/prebuilt/macos_universal"
+    local merged="$universal_cache/liblitert_lm_capi.dylib"
+    mkdir -p "$universal_cache"
+
+    # Rebuild the merged file whenever either slice is newer than it
+    if [ ! -f "$merged" ] || [ "$arm" -nt "$merged" ] || [ "$x86" -nt "$merged" ]; then
+        lipo -create "$arm" "$x86" -output "$merged.tmp" && mv -f "$merged.tmp" "$merged"
+        # Give the merged library a sane install name instead of the bazel-out path
+        install_name_tool -id "@rpath/litertlm/liblitert_lm_capi.dylib" "$merged" 2>/dev/null || true
+        echo "  [lipo]     liblitert_lm_capi.dylib -> $(lipo -archs "$merged")"
+    fi
+
+    # Always overwrite: a stale single-arch copy from an earlier build must not survive
+    cp -f "$merged" "$NATIVES_DIR/liblitert_lm_capi.dylib"
+    sign_lib "$NATIVES_DIR/liblitert_lm_capi.dylib"
+
+    # Remove single-arch accelerator leftovers from earlier host-arch builds
+    for lib in "${PREBUILT_LIBS[@]}"; do
+        [ "$lib" = "liblitert_lm_capi.dylib" ] && continue
+        rm -f "$NATIVES_DIR/$lib"
+    done
+    echo "  [ok]       $(lipo -archs "$NATIVES_DIR/liblitert_lm_capi.dylib")"
+    return 0
+}
+
+# ============================================================================
 # Main
 # ============================================================================
-install_prebuilt_libs
+# Prefer the universal path; fall back to the legacy host-arch behaviour when
+# only one architecture has been built locally.
+if ! install_universal_capi; then
+    install_prebuilt_libs
+fi
 
 # Summary
 echo ""
