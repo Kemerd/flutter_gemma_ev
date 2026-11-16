@@ -55,7 +55,7 @@ class EmbeddingModel {
         // See: https://github.com/DenisovAV/flutter_gemma/issues/155
         options.isXNNPackEnabled = false
 
-        // Note: Select TF Ops should be automatically available when TensorFlowLiteSelectTfOps is linked
+        // Note: Select TF ops (Flex) are not linked; only builtin-op .tflite models load here.
 
         // Load the model with optimized settings
         do {

@@ -46,7 +46,10 @@ Includes support for Gemma 3 Nano models with optimized MediaPipe GenAI v0.10.24
   s.dependency 'MediaPipeTasksGenAIC', '= 0.10.24'
   s.dependency 'TensorFlowLiteC', '0.0.1-nightly.20250619'
   s.dependency 'TensorFlowLiteSwift', '0.0.1-nightly.20250619'
-  s.dependency 'TensorFlowLiteSelectTfOps', '0.0.1-nightly.20250619'
+  # TensorFlowLiteSelectTfOps (Flex delegate) intentionally NOT linked:
+  # embeddings run through ONNX Runtime now, the native TFLite embedder only
+  # needs builtin ops, and the Select TF ops xcframework ships no simulator
+  # slice (it broke every simulator build) while adding ~100 MB to the app.
   s.platform = :ios, '16.0'
 
   # C++ library linkage
@@ -65,10 +68,8 @@ Includes support for Gemma 3 Nano models with optimized MediaPipe GenAI v0.10.24
     'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) HAVE_PTHREAD=1 GOOGLE_PROTOBUF_NO_RTTI=1 protobuf=protobuf_sentencepiece',
     'HEADER_SEARCH_PATHS' => '"${PODS_TARGET_SRCROOT}/Classes/sentencepiece" "${PODS_TARGET_SRCROOT}/Classes/sentencepiece/src" "${PODS_TARGET_SRCROOT}/Classes/sentencepiece/src/builtin_pb" "${PODS_TARGET_SRCROOT}/Classes/sentencepiece/third_party/protobuf-lite" "${PODS_TARGET_SRCROOT}/Classes/sentencepiece/third_party"',
     'OTHER_CPLUSPLUSFLAGS' => '-fvisibility=hidden -fvisibility-inlines-hidden -ffunction-sections -fdata-sections',
-    # Conditional force_load: only for device builds (TensorFlowLiteSelectTfOps doesn't have simulator slice)
-    'OTHER_LDFLAGS[sdk=iphoneos*]' => '-force_load $(SRCROOT)/Pods/TensorFlowLiteSelectTfOps/Frameworks/TensorFlowLiteSelectTfOps.xcframework/ios-arm64/TensorFlowLiteSelectTfOps.framework/TensorFlowLiteSelectTfOps -lc++',
-    # Don't force_load on simulator (TensorFlowLiteSelectTfOps.xcframework only contains ios-arm64 slice)
-    'OTHER_LDFLAGS[sdk=iphonesimulator*]' => '-lc++'
+    # Plain libc++ linkage on device and simulator alike (no Select TF ops force_load)
+    'OTHER_LDFLAGS' => '-lc++'
   }
 
   # ONNX Runtime embeddings (dart:ffi) look up the ORT C API in the app
