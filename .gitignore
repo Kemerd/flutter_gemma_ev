@@ -55,3 +55,6 @@ macos/Resources/litertlm-server.jar
 temporary_docs/
 DESKTOP_DEBUG.md
 /model
+
+# LLVM coverage dumps (instrumented native builds write these on exit)
+*.profraw

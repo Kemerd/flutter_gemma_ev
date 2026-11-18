@@ -87,6 +87,36 @@ class LiteRtLmNativeClient {
   }
 
   // ==========================================================================
+  // macOS constraint provider preload
+  // ==========================================================================
+
+  /// Kept for the life of the process: the C API's symbol bindings point
+  /// into this image, so it must never be released.
+  static DynamicLibrary? _constraintProvider;
+
+  /// Loads `libGemmaModelConstraintProvider.dylib` from [directory] once.
+  ///
+  /// Bundled builds ship upstream's stub (tool-call grammar constraints are
+  /// unused here, so a provider that never constrains is correct). Missing
+  /// file or load failure is logged and left to the main library load to
+  /// report, since that error names the actual missing symbol.
+  static void _preloadConstraintProvider(String directory) {
+    if (_constraintProvider != null) return;
+    final providerPath =
+        path.join(directory, 'libGemmaModelConstraintProvider.dylib');
+    if (!File(providerPath).existsSync()) {
+      debugPrint('[LiteRtLmNative] No constraint provider at $providerPath');
+      return;
+    }
+    try {
+      _constraintProvider = DynamicLibrary.open(providerPath);
+      debugPrint('[LiteRtLmNative] Preloaded constraint provider');
+    } catch (e) {
+      debugPrint('[LiteRtLmNative] Could not preload constraint provider: $e');
+    }
+  }
+
+  // ==========================================================================
   // Library Loading — finds the right .dll/.so/.dylib for the current platform
   // ==========================================================================
 
@@ -188,6 +218,15 @@ class LiteRtLmNativeClient {
     // and friends when loading litert_lm_capi.dll.
     if (Platform.isWindows) {
       _addDllDirectory(path.dirname(libraryPath));
+    }
+
+    // macOS: the C API references the Gemma constraint provider through
+    // flat-namespace lookups that dyld resolves at load time. Load the
+    // provider (or its stub) first; macOS dlopen defaults to RTLD_GLOBAL, so
+    // its exports satisfy those lookups. Without it the engine library itself
+    // fails to load with "symbol not found in flat namespace".
+    if (Platform.isMacOS) {
+      _preloadConstraintProvider(path.dirname(libraryPath));
     }
 
     try {

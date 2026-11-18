@@ -202,9 +202,25 @@ install_universal_capi() {
     cp -f "$merged" "$NATIVES_DIR/liblitert_lm_capi.dylib"
     sign_lib "$NATIVES_DIR/liblitert_lm_capi.dylib"
 
+    # The C API resolves three LiteRtLmGemmaModelConstraintProvider_* symbols
+    # through flat-namespace lookups at load time. Upstream's real provider is
+    # an arm64-only Git LFS prebuilt, so ship upstream's universal stub
+    # (native/constraint_provider_stub). The Dart loader preloads it.
+    local provider="$PLUGIN_ROOT/native/prebuilt/macos_universal/libGemmaModelConstraintProvider.dylib"
+    local keep_provider=false
+    if lipo -archs "$provider" 2>/dev/null | grep -qw x86_64; then
+        cp -f "$provider" "$NATIVES_DIR/libGemmaModelConstraintProvider.dylib"
+        sign_lib "$NATIVES_DIR/libGemmaModelConstraintProvider.dylib"
+        keep_provider=true
+        echo "  [stub]     libGemmaModelConstraintProvider.dylib -> $(lipo -archs "$provider")"
+    fi
+
     # Remove single-arch accelerator leftovers from earlier host-arch builds
     for lib in "${PREBUILT_LIBS[@]}"; do
         [ "$lib" = "liblitert_lm_capi.dylib" ] && continue
+        if [ "$lib" = "libGemmaModelConstraintProvider.dylib" ] && [ "$keep_provider" = true ]; then
+            continue
+        fi
         rm -f "$NATIVES_DIR/$lib"
     done
     echo "  [ok]       $(lipo -archs "$NATIVES_DIR/liblitert_lm_capi.dylib")"
