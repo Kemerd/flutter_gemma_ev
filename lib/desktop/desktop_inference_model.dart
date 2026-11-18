@@ -72,6 +72,9 @@ class DesktopInferenceModel extends InferenceModel {
       completer.complete(session);
       return session;
     } catch (e, st) {
+      // Joined callers still get the error; with none, don't let the failed
+      // future also surface as an uncaught async error (caller gets rethrow)
+      completer.future.ignore();
       completer.completeError(e, st);
       _createCompleter = null;
       rethrow;

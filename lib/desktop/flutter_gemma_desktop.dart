@@ -167,7 +167,12 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
         if (errorMsg.contains('FileNotFoundException') ||
             errorMsg.contains('No such file') ||
             errorMsg.contains('not found')) {
-          throw Exception('Model file not found or inaccessible: $modelPath');
+          // Keep the native message: "not found" also matches engine errors
+          // (missing model sections, unsupported formats), and without the
+          // original text those look exactly like a missing file.
+          throw Exception(
+            'Model file not found or inaccessible: $modelPath ($errorMsg)',
+          );
         }
 
         // If GPU was requested and failed, fall back to CPU automatically.
@@ -229,6 +234,11 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
       completer.complete(model);
       return model;
     } catch (e, st) {
+      // Callers that joined this init through completer.future still get the
+      // error. Mark the future handled first: when nobody joined, completing
+      // it with an error would otherwise also surface as an uncaught async
+      // error, on top of the rethrow the caller already receives.
+      completer.future.ignore();
       completer.completeError(e, st);
       _initCompleter = null;
       rethrow;
@@ -361,6 +371,9 @@ class FlutterGemmaDesktop extends FlutterGemmaPlugin {
       _initEmbeddingCompleter = null;
       _initializedEmbeddingModel = null;
       _lastActiveEmbeddingSpec = null;
+      // Joined callers still get the error; with none, don't let the failed
+      // future also surface as an uncaught async error (caller gets rethrow)
+      completer.future.ignore();
       completer.completeError(e, st);
       Error.throwWithStackTrace(e, st);
     }
